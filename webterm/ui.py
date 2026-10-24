@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual import on
 from textual.widgets import Button, Footer, Header, Input, Static
 
@@ -12,112 +14,9 @@ from . import core
 from .browser_view import BrowserTab, BrowserView
 from .page_widget import ClickablePage
 
-CSS = """
-Screen {
-    layout: vertical;
-}
-
-Header {
-    height: 1;
-}
-
-Footer {
-    height: 1;
-}
-
-#toolbar {
-    height: 3;
-    width: 100%;
-    padding: 0 1;
-    background: $surface;
-    align: left middle;
-}
-
-#toolbar Button {
-    width: auto;
-    min-width: 5;
-    max-width: 10;
-    height: 3;
-    margin: 0;
-    padding: 0 1;
-}
-
-#url {
-    width: 1fr;
-    min-width: 10;
-    height: 3;
-    margin: 0 1;
-}
-
-#tabbar {
-    height: 3;
-    width: 100%;
-    padding: 0 1;
-    background: $surface;
-    align: left middle;
-}
-
-#tabbar Button {
-    width: auto;
-    min-width: 8;
-    max-width: 22;
-    height: 3;
-    margin: 0 1 0 0;
-    padding: 0 1;
-}
-
-#page {
-    height: 1fr;
-    min-height: 4;
-    margin: 1 1 0 1;
-    padding: 0;
-    border: round $primary;
-    background: #101114;
-}
-
-#forms {
-    height: auto;
-    max-height: 12;
-    overflow-y: auto;
-    padding: 0 1;
-}
-
-.form-panel {
-    height: auto;
-    margin: 1 0;
-    padding: 1;
-    border: round $secondary;
-}
-
-.form-label {
-    height: auto;
-    margin: 0;
-}
-
-.form-control {
-    width: 1fr;
-    height: auto;
-    margin: 0 0 1 0;
-}
-
-.form-buttons {
-    height: 3;
-    width: auto;
-}
-
-.form-buttons Button {
-    width: auto;
-    min-width: 8;
-    height: 3;
-    margin: 0 1 0 0;
-    padding: 0 1;
-}
-
-#status {
-    height: 1;
-    padding: 0 1;
-}
-"""
+CSS = (
+    Path(__file__).resolve().parent / "static" / "app.tcss"
+).read_text(encoding="utf-8")
 
 
 class Webterm(App):
@@ -163,7 +62,9 @@ class Webterm(App):
         with Horizontal(id="tabbar"):
             yield Button("+ New Tab", id="new-tab", variant="success")
 
-        with Vertical(id="page"):
+        # One scroll container owns both rendered page text and its forms.
+        # This prevents the forms panel from creating a second scrollbar.
+        with VerticalScroll(id="page"):
             yield ClickablePage(id="page-text")
             with Vertical(id="forms"):
                 pass

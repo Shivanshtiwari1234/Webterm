@@ -1,4 +1,4 @@
-"""Background HTTP server for Webterm's built-in landing page."""
+"""Background HTTP server for Webterm static resources."""
 
 from __future__ import annotations
 
@@ -8,28 +8,28 @@ from pathlib import Path
 from threading import Thread
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LANDING_DIR = PROJECT_ROOT / "landing"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 class QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
-    """Serve landing assets without cluttering the terminal with logs."""
+    """Serve static assets without cluttering the terminal with logs."""
 
     def log_message(self, format: str, *args: object) -> None:
         pass
 
 
-class LandingServer:
-    """Serve the landing directory on a local HTTP server thread."""
+class StaticServer:
+    """Serve the static directory on a local HTTP server thread."""
 
     def __init__(self) -> None:
-        if not (LANDING_DIR / "index.html").is_file():
+        if not (STATIC_DIR / "index.html").is_file():
             raise FileNotFoundError(
-                f"Landing page not found: {LANDING_DIR / 'index.html'}"
+                f"Static start page not found: {STATIC_DIR / 'index.html'}"
             )
 
         handler = partial(
             QuietHTTPRequestHandler,
-            directory=str(LANDING_DIR),
+            directory=str(STATIC_DIR),
         )
 
         self._server = ThreadingHTTPServer(
@@ -40,7 +40,7 @@ class LandingServer:
 
         self._thread = Thread(
             target=self._server.serve_forever,
-            name="webterm-landing-server",
+            name="webterm-static-server",
             daemon=True,
         )
         self._started = False
@@ -48,14 +48,14 @@ class LandingServer:
 
     @property
     def url(self) -> str:
-        """Return the local landing page URL."""
+        """Return the local start-page URL."""
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}/"
 
     def start(self) -> str:
         """Start the server and return its URL."""
         if self._closed:
-            raise RuntimeError("Cannot start a stopped landing server.")
+            raise RuntimeError("Cannot start a stopped static server.")
 
         if not self._started:
             self._thread.start()

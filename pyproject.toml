@@ -45,3 +45,6 @@ webterm = "main:main"
 [tool.setuptools]
 py-modules = ["main"]
 packages = ["webterm"]
+
+[tool.setuptools.package-data]
+webterm = ["static/*"]

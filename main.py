@@ -1,16 +1,16 @@
 """Webterm application entry point."""
 
-from webterm.landing_server import LandingServer
+from webterm.static_server import StaticServer
 from webterm import core
 from webterm.ui import Webterm
 
 
 def main() -> None:
-    server = LandingServer()
+    server = StaticServer()
 
     try:
-        landing_url = server.start()
-        core.set_home_url(landing_url)
+        start_url = server.start()
+        core.set_home_url(start_url)
 
         Webterm().run()
     finally:

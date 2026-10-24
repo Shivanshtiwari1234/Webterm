@@ -1,1 +1,0 @@
-"""Webterm landing page package."""

@@ -281,19 +281,18 @@ class JavaScriptRuntime:
         return None
 
     def close(self) -> None:
-        """Stop this tab's worker and release its resources."""
+        """Ask the worker to exit cleanly, then force-stop if it does not."""
         if self._closed:
             return
-
         self._closed = True
-
-        if self._parent is not None and self._process is not None:
+        process = self._process
+        parent = self._parent
+        if parent is not None and process is not None and process.is_alive():
             try:
-                if self._process.is_alive():
-                    self._parent.send(("close", None))
+                parent.send(("close", None))
             except (BrokenPipeError, EOFError, OSError):
                 pass
-
+            process.join(timeout=0.5)
         self._stop_worker()
 
     def __enter__(self) -> JavaScriptRuntime:

@@ -17,7 +17,7 @@ from .core import (
     normalize_address,
     parse_forms,
     parse_page,
-    submit_form,
+    submit_form as send_form,
 )
 from .javascript import JavaScriptRuntime
 from .page_widget import ClickablePage
@@ -37,6 +37,7 @@ class BrowserTab:
     forward_stack: list[str] = field(default_factory=list)
     loading: bool = False
     js: JavaScriptRuntime | None = None
+    navigation_id: int = 0
 
 
 class BrowserView:
@@ -51,15 +52,16 @@ class BrowserView:
     def tab(self) -> BrowserTab | None:
         return self.app.active_tab
 
-    def status(self, message: str) -> None:
+    def status(self, message: str, tab: BrowserTab | None = None) -> None:
+        # Background tabs must not overwrite the visible tab's status.
+        if tab is not None and tab.tab_id != self.app.active_tab_id:
+            return
         self.app.query_one("#status", Static).update(message)
 
     def get_runtime(self, tab: BrowserTab) -> JavaScriptRuntime:
         """Create a JavaScript runtime if one is not already available."""
-
         if tab.js is None:
             tab.js = JavaScriptRuntime()
-
         return tab.js
 
     @staticmethod
@@ -83,19 +85,17 @@ class BrowserView:
             if page.plain and not page.plain.endswith("\n"):
                 page.append("\n")
 
-            page.append("\n--- JavaScript console ---\n", style="bold yellow")
+            page.append("\n── JavaScript console ──\n", style="bold yellow")
             page.append(logs.strip(), style="dim")
 
         return page
 
     async def _display_tab(self, tab: BrowserTab) -> None:
         """Update visible content if this is the active tab."""
-
         if tab.tab_id != self.app.active_tab_id:
             return
 
         self.app.query_one("#url", Input).value = tab.url
-
         self.app.query_one("#page-text", ClickablePage).set_page(
             tab.content,
             tab.links,
@@ -111,154 +111,166 @@ class BrowserView:
         *,
         record_history: bool = True,
         tab: BrowserTab | None = None,
-    ) -> None:
-        """Navigate to a URL or a numbered link."""
-
+    ) -> bool:
+        """Navigate safely; return False if the request fails or is superseded."""
         tab = tab or self.tab
-
         if tab is None:
-            return
+            return False
+        address = address.strip()
+        if not address:
+            return False
+
+        # A numeric address is a link only when that link exists. Otherwise it
+        # remains a valid search query (for example, "2026").
+        if address.isdigit() and int(address) in tab.links:
+            address = tab.links[int(address)]
 
         try:
-            address = address.strip()
-
-            if not address:
-                return
-
-            if address.isdigit():
-                link_url = tab.links.get(int(address))
-
-                if link_url is None:
-                    self.status(f"Link {address} does not exist.")
-                    return
-
-                address = link_url
-
             url = normalize_address(address)
-
             if not url:
-                return
+                return False
+        except Exception as exc:
+            self.status(f"Invalid address: {exc}", tab)
+            return False
 
-            tab.loading = True
-            self.status(f"Loading {url} ...")
+        tab.navigation_id += 1
+        request_id = tab.navigation_id
+        tab.loading = True
+        self.status(f"Loading {url} ...", tab)
+        old_url = tab.url
 
+        try:
             final_url, html = await fetch_page(url)
+            if request_id != tab.navigation_id:
+                return False
 
-            if record_history and tab.url and tab.url != final_url:
-                tab.back_stack.append(tab.url)
-                tab.forward_stack.clear()
-
-            tab.url = final_url
-            tab.title = self.extract_title(html) or (
-                urlparse(final_url).hostname or "Page"
-            )
-
-            tab.forms = parse_forms(html, final_url)
-
-            # JavaScript is disabled temporarily to avoid the multiprocessing
-            # failure previously encountered under Textual.
+            title = self.extract_title(html) or (urlparse(final_url).hostname or "Page")
+            forms = parse_forms(html, final_url)
             page, links, js_logs = parse_page(html, final_url, None)
+            content = self._append_console_logs(page, js_logs)
 
+            # Commit page state only after a successful, current response.
+            if record_history and old_url and old_url != final_url:
+                tab.back_stack.append(old_url)
+                tab.forward_stack.clear()
+            tab.url = final_url
+            tab.title = title
+            tab.forms = forms
             tab.links = links
-            tab.content = self._append_console_logs(page, js_logs)
-
+            tab.content = content
             await self._display_tab(tab)
-            self.status(f"{tab.title} — {final_url}")
+            self.status(f"{tab.title} — {final_url}", tab)
+            return True
 
         except Exception as exc:
-            if tab.tab_id == self.app.active_tab_id:
-                error_page = Text()
-                error_page.append("Could not load page\n", style="bold red")
-                error_page.append(
-                    f"{type(exc).__name__}: {exc}",
-                    style="yellow",
-                )
-
-                tab.content = error_page
-                tab.links.clear()
-
-                self.app.query_one("#page-text", ClickablePage).set_page(
-                    error_page, {}, tab.url
-                )
-                try:
-                    await self.render_forms(tab)
-                except Exception:
-                    pass
-                self.status("Navigation failed")
-
+            if request_id != tab.navigation_id:
+                return False
+            tab.forms = []
+            tab.links = {}
+            tab.title = "Navigation error"
+            error_page = Text()
+            error_page.append("Could not load page\\n", style="bold red")
+            error_page.append(f"{type(exc).__name__}: {exc}", style="yellow")
+            tab.content = error_page
+            await self._display_tab(tab)
+            self.status("Navigation failed", tab)
+            return False
         finally:
-            tab.loading = False
+            if request_id == tab.navigation_id:
+                tab.loading = False
 
     async def render_forms(self, tab: BrowserTab) -> None:
-        """Render supported HTML forms beneath the page content."""
-
+        """Render supported HTML forms beneath the page."""
         container = self.app.query_one("#forms", Vertical)
         await container.remove_children()
+
+        # Rebuild this mapping whenever the form panel is rebuilt.
         self.form_widgets.clear()
 
         for form in tab.forms:
+            visible_fields = [
+                item
+                for item in form.fields
+                if not item.disabled
+                and item.field_type != "hidden"
+                and (item.name or item.field_type == "checkbox")
+            ]
+
+            # Don't render an empty panel for forms that only contain hidden
+            # fields or unsupported controls.
+            if not visible_fields and not form.submit_name:
+                continue
+
             panel = Vertical(classes="form-panel")
             await container.mount(panel)
-            await panel.mount(Label(f"Form {form.index + 1}", classes="form-label"))
 
-            for item in form.fields:
-                if item.disabled or item.field_type == "hidden":
-                    continue
+            await panel.mount(Label(f"Form {form.index + 1}", classes="form-heading"))
 
-                if not item.name and item.field_type != "checkbox":
-                    continue
-
+            for item in visible_fields:
                 label = item.label or item.name or item.field_type.title()
-                await panel.mount(Label(label, classes="form-label"))
 
                 widget_id = self.next_widget_id
                 self.next_widget_id += 1
+
                 common = {
                     "id": f"field-{widget_id}",
                     "classes": "form-control",
                 }
 
-                if item.field_type == "checkbox":
+                if item.field_type in {"checkbox", "radio"}:
                     widget = Checkbox(
                         label,
                         value=item.checked,
                         **common,
                     )
-
-                elif item.field_type == "select":
-                    options = [
-                        (option_label, option_value)
-                        for option_value, option_label in item.options
-                    ]
-                    valid_values = {value for _, value in options}
-
-                    initial_value = (
-                        item.value
-                        if item.value in valid_values
-                        else (
-                            options[0][1] if options and item.required else Select.BLANK
-                        )
-                    )
-
-                    widget = Select(
-                        options,
-                        value=initial_value,
-                        allow_blank=not item.required,
-                        **common,
-                    )
-
-                elif item.field_type == "textarea":
-                    widget = TextArea(item.value, **common)
+                    await panel.mount(widget)
 
                 else:
-                    widget = Input(
-                        value=item.value,
-                        placeholder=item.placeholder or label,
-                        password=item.field_type == "password",
-                        **common,
-                    )
+                    await panel.mount(Label(label, classes="form-label"))
 
-                await panel.mount(widget)
+                    if item.field_type == "select" and item.multiple:
+                        widget = TextArea(item.value, **common)
+
+                    elif item.field_type == "select":
+                        options = [
+                            (option_label, option_value)
+                            for option_value, option_label in item.options
+                        ]
+                        valid_values = {value for _, value in options}
+
+                        initial_value = (
+                            item.value
+                            if item.value in valid_values
+                            else (
+                                options[0][1]
+                                if options and item.required
+                                else Select.BLANK
+                            )
+                        )
+
+                        widget = Select(
+                            options,
+                            value=initial_value,
+                            allow_blank=not item.required,
+                            **common,
+                        )
+
+                    elif item.field_type == "textarea":
+                        widget = TextArea(
+                            item.value,
+                            **common,
+                        )
+
+                    else:
+                        widget = Input(
+                            value=item.value,
+                            placeholder=item.placeholder or label,
+                            password=item.field_type == "password",
+                            **common,
+                        )
+
+                    await panel.mount(widget)
+
                 self.form_widgets[(form.index, item.index)] = widget
 
             buttons = Horizontal(classes="form-buttons")
@@ -287,7 +299,11 @@ class BrowserView:
         for item in form.fields:
             widget = self.form_widgets.get((form.index, item.index))
 
-            if isinstance(widget, Checkbox):
+            # Hidden fields have no widget; retain their original values.
+            if item.field_type == "hidden":
+                values[item.index] = item.value
+
+            elif isinstance(widget, Checkbox):
                 values[item.index] = widget.value
 
             elif isinstance(widget, Select):
@@ -308,9 +324,7 @@ class BrowserView:
 
     async def submit_form(self, form_index: int) -> None:
         """Submit a form from the current page."""
-
         tab = self.tab
-
         if tab is None:
             return
 
@@ -318,18 +332,22 @@ class BrowserView:
             (form for form in tab.forms if form.index == form_index),
             None,
         )
-
         if form is None:
             self.status("Form no longer exists.")
             return
 
         try:
             values = self._collect_form_values(form)
-            self.status("Submitting form ...")
+            tab.navigation_id += 1
+            request_id = tab.navigation_id
+            original_url = tab.url
+            self.status("Submitting form ...", tab)
 
-            final_url, html = await submit_form(form, values, tab.url)
+            final_url, html = await send_form(form, values, original_url)
+            if request_id != tab.navigation_id:
+                return
 
-            if tab.url and tab.url != final_url:
+            if original_url and original_url != final_url:
                 tab.back_stack.append(tab.url)
                 tab.forward_stack.clear()
 
@@ -340,21 +358,18 @@ class BrowserView:
 
             tab.forms = parse_forms(html, final_url)
             page, links, js_logs = parse_page(html, final_url, None)
-
             tab.links = links
             tab.content = self._append_console_logs(page, js_logs)
 
             await self._display_tab(tab)
-            self.status(f"Form submitted — {final_url}")
+            self.status(f"Form submitted — {final_url}", tab)
 
         except Exception as exc:
-            self.status(f"Form error: {type(exc).__name__}: {exc}")
+            self.status(f"Form error: {type(exc).__name__}: {exc}", tab)
 
     async def reset_form(self, form_index: int) -> None:
         """Reset controls to their parsed initial values."""
-
         tab = self.tab
-
         if tab is None:
             return
 
@@ -362,7 +377,6 @@ class BrowserView:
             (form for form in tab.forms if form.index == form_index),
             None,
         )
-
         if form is None:
             return
 
@@ -388,46 +402,39 @@ class BrowserView:
 
     async def go_back(self) -> None:
         tab = self.tab
-
         if tab is None or not tab.back_stack:
-            self.status("No previous page.")
+            self.status("No previous page.", tab)
             return
-
-        previous = tab.back_stack.pop()
-
-        if tab.url:
-            tab.forward_stack.append(tab.url)
-
-        await self.navigate(previous, record_history=False, tab=tab)
+        previous = tab.back_stack[-1]
+        current = tab.url
+        if await self.navigate(previous, record_history=False, tab=tab):
+            tab.back_stack.pop()
+            if current:
+                tab.forward_stack.append(current)
 
     async def go_forward(self) -> None:
         tab = self.tab
-
         if tab is None or not tab.forward_stack:
-            self.status("No forward page.")
+            self.status("No forward page.", tab)
             return
-
-        following = tab.forward_stack.pop()
-
-        if tab.url:
-            tab.back_stack.append(tab.url)
-
-        await self.navigate(following, record_history=False, tab=tab)
+        following = tab.forward_stack[-1]
+        current = tab.url
+        if await self.navigate(following, record_history=False, tab=tab):
+            tab.forward_stack.pop()
+            if current:
+                tab.back_stack.append(current)
 
     async def reload(self) -> None:
         tab = self.tab
-
         if tab is not None and tab.url:
             await self.navigate(tab.url, record_history=False, tab=tab)
 
     async def open_link(self, number: int) -> None:
         tab = self.tab
-
         if tab is None:
             return
 
         url = tab.links.get(number)
-
         if url is None:
             self.status(f"Link {number} does not exist.")
             return
