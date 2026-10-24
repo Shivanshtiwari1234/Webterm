@@ -1,6 +1,6 @@
 """Webterm application entry point."""
 
-from landing.server import LandingServer
+from webterm.landing_server import LandingServer
 from webterm import core
 from webterm.ui import Webterm
 

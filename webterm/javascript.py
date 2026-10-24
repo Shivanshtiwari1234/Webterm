@@ -258,9 +258,7 @@ class JavaScriptRuntime:
                     result = values[0]
 
                 elif kind == "error":
-                    self.console_messages.append(
-                        f"[JavaScript error] {values[0]}"
-                    )
+                    self.console_messages.append(f"[JavaScript error] {values[0]}")
 
                 elif kind == "fatal":
                     self.console_messages.append(

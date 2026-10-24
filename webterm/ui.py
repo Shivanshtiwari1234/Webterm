@@ -1,93 +1,144 @@
-"""Textual application shell for Webterm."""
+"""Main Textual application for Webterm."""
 
 from __future__ import annotations
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, VerticalScroll, Vertical
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual import on
 from textual.widgets import Button, Footer, Header, Input, Static
 
 from . import core
 from .browser_view import BrowserTab, BrowserView
+from .page_widget import ClickablePage
+
+CSS = """
+Screen {
+    layout: vertical;
+}
+
+Header {
+    height: 1;
+}
+
+Footer {
+    height: 1;
+}
+
+#toolbar {
+    height: 3;
+    width: 100%;
+    padding: 0 1;
+    background: $surface;
+    align: left middle;
+}
+
+#toolbar Button {
+    width: auto;
+    min-width: 5;
+    max-width: 10;
+    height: 3;
+    margin: 0;
+    padding: 0 1;
+}
+
+#url {
+    width: 1fr;
+    min-width: 10;
+    height: 3;
+    margin: 0 1;
+}
+
+#tabbar {
+    height: 3;
+    width: 100%;
+    padding: 0 1;
+    background: $surface;
+    align: left middle;
+}
+
+#tabbar Button {
+    width: auto;
+    min-width: 8;
+    max-width: 22;
+    height: 3;
+    margin: 0 1 0 0;
+    padding: 0 1;
+}
+
+#page {
+    height: 1fr;
+    min-height: 4;
+    margin: 1 1 0 1;
+    padding: 0;
+    border: round $primary;
+    background: #101114;
+}
+
+#forms {
+    height: auto;
+    max-height: 12;
+    overflow-y: auto;
+    padding: 0 1;
+}
+
+.form-panel {
+    height: auto;
+    margin: 1 0;
+    padding: 1;
+    border: round $secondary;
+}
+
+.form-label {
+    height: auto;
+    margin: 0;
+}
+
+.form-control {
+    width: 1fr;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.form-buttons {
+    height: 3;
+    width: auto;
+}
+
+.form-buttons Button {
+    width: auto;
+    min-width: 8;
+    height: 3;
+    margin: 0 1 0 0;
+    padding: 0 1;
+}
+
+#status {
+    height: 1;
+    padding: 0 1;
+}
+"""
 
 
 class Webterm(App):
-    """A keyboard-friendly terminal browser."""
+    """A keyboard-first terminal web browser."""
 
-    TITLE = "Webterm"
-    SUB_TITLE = "Terminal Web Browser"
-
-    CSS = """
-    #toolbar {
-        height: 3;
-        padding: 0 1;
-    }
-
-    #url {
-        width: 1fr;
-    }
-
-    #tabbar {
-        height: 3;
-        padding: 0 1;
-    }
-
-    #page {
-        height: 1fr;
-        border: round $primary;
-        padding: 1 2;
-    }
-
-    #page-text {
-        width: 100%;
-        height: auto;
-    }
-
-    #forms {
-        height: auto;
-        padding-top: 1;
-    }
-
-    .form-panel {
-        border: round $secondary;
-        padding: 1;
-        margin-bottom: 1;
-        height: auto;
-    }
-
-    .form-label {
-        margin-top: 1;
-    }
-
-    .form-control {
-        width: 100%;
-        margin-bottom: 1;
-    }
-
-    .form-buttons {
-        height: auto;
-        margin-top: 1;
-    }
-
-    #status {
-        height: 1;
-        padding: 0 1;
-    }
-    """
+    TITLE = "Webterm — Terminal Web Browser"
+    CSS = CSS
 
     BINDINGS = [
-        ("ctrl+l", "focus_address", "Address"),
-        ("ctrl+t", "new_tab", "New tab"),
-        ("ctrl+w", "close_tab", "Close tab"),
-        ("ctrl+r", "reload_page", "Reload"),
-        ("alt+left", "go_back", "Back"),
-        ("alt+right", "go_forward", "Forward"),
-        ("escape", "focus_address", "Focus address"),
+        Binding("ctrl+l", "focus_address", "Address"),
+        Binding("ctrl+t", "new_tab", "New tab"),
+        Binding("ctrl+w", "close_tab", "Close tab"),
+        Binding("ctrl+r", "reload", "Reload"),
+        Binding("alt+left", "back", "Back"),
+        Binding("alt+right", "forward", "Forward"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
         self.tabs: list[BrowserTab] = []
-        self.active_tab_id: int | None = None
+        self.active_tab_id = 0
         self.next_tab_id = 1
         self.browser = BrowserView(self)
 
@@ -112,85 +163,169 @@ class Webterm(App):
         with Horizontal(id="tabbar"):
             yield Button("+ New Tab", id="new-tab", variant="success")
 
-        with VerticalScroll(id="page"):
-            yield Static("Starting Webterm...", id="page-text", markup=False)
-            yield Vertical(id="forms")
+        with Vertical(id="page"):
+            yield ClickablePage(id="page-text")
+            with Vertical(id="forms"):
+                pass
 
         yield Static("Ready", id="status")
         yield Footer()
 
-    def create_tab(self) -> BrowserTab:
-        tab = BrowserTab(tab_id=self.next_tab_id)
-        self.next_tab_id += 1
-        self.tabs.append(tab)
-        self.active_tab_id = tab.tab_id
-        return tab
-
     async def on_mount(self) -> None:
-        self.create_tab()
-        await self.refresh_tabbar()
+        await self.create_tab(load=False)
         await self.browser.navigate(core.HOME_URL)
         self.query_one("#url", Input).focus()
 
     async def refresh_tabbar(self) -> None:
-        tabbar = self.query_one("#tabbar", Horizontal)
-        await tabbar.remove_children()
-        await tabbar.mount(
-            Button("+ New Tab", id="new-tab", variant="success")
-        )
+        """Rebuild the tab bar using compact labels."""
+
+        bar = self.query_one("#tabbar", Horizontal)
+
+        for child in list(bar.children):
+            await child.remove()
 
         for tab in self.tabs:
-            label = tab.title[:18]
-            if tab.tab_id == self.active_tab_id:
-                label = f"[{label}]"
+            marker = "● " if tab.tab_id == self.active_tab_id else ""
+            title = tab.title or "New Tab"
 
-            await tabbar.mount(
+            if len(title) > 19:
+                title = title[:16] + "..."
+
+            await bar.mount(
                 Button(
-                    label,
+                    marker + title,
                     id=f"tab-{tab.tab_id}",
-                    variant="primary" if tab.tab_id == self.active_tab_id else "default",
+                    variant=(
+                        "primary" if tab.tab_id == self.active_tab_id else "default"
+                    ),
                 )
             )
 
-    async def activate_tab(self, tab_id: int) -> None:
-        tab = next((t for t in self.tabs if t.tab_id == tab_id), None)
+        await bar.mount(Button("+ New Tab", id="new-tab", variant="success"))
+
+    async def create_tab(
+        self,
+        *,
+        load: bool = True,
+        url: str | None = None,
+    ) -> None:
+        tab = BrowserTab(tab_id=self.next_tab_id)
+        self.next_tab_id += 1
+
+        self.tabs.append(tab)
+        self.active_tab_id = tab.tab_id
+
+        await self.refresh_tabbar()
+
+        if load:
+            await self.browser.navigate(url or core.HOME_URL, tab=tab)
+        else:
+            tab.content.plain = "Webterm\n\nEnter a URL or search."
+            self.query_one("#page-text", ClickablePage).set_page(
+                tab.content, {}, tab.url
+            )
+
+    async def switch_tab(self, tab_id: int) -> None:
+        tab = next((item for item in self.tabs if item.tab_id == tab_id), None)
+
         if tab is None:
             return
 
         self.active_tab_id = tab_id
+
         self.query_one("#url", Input).value = tab.url
-        self.query_one("#page-text", Static).update(tab.content or "New tab")
+        self.query_one("#page-text", ClickablePage).set_page(
+            tab.content, tab.links, tab.url
+        )
+
         await self.browser.render_forms(tab)
         await self.refresh_tabbar()
-        self.query_one("#status", Static).update(f"Tab {tab.tab_id}: {tab.title}")
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "url":
-            await self.open_address()
+    async def close_current_tab(self) -> None:
+        tab = self.active_tab
 
-    async def open_address(self) -> None:
-        address = self.query_one("#url", Input).value.strip()
-        if address:
-            await self.browser.navigate(address)
+        if tab is None:
+            return
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if len(self.tabs) == 1:
+            if tab.js is not None:
+                try:
+                    tab.js.close()
+                except Exception:
+                    pass
+
+            tab.js = None
+            tab.url = ""
+            tab.title = "New Tab"
+            tab.content = __import__("rich.text", fromlist=["Text"]).Text("New Tab")
+            tab.links.clear()
+            tab.forms.clear()
+            tab.back_stack.clear()
+            tab.forward_stack.clear()
+
+            await self.switch_tab(tab.tab_id)
+            return
+
+        index = self.tabs.index(tab)
+        self.tabs.remove(tab)
+
+        if tab.js is not None:
+            try:
+                tab.js.close()
+            except Exception:
+                pass
+
+        next_index = min(index, len(self.tabs) - 1)
+        await self.switch_tab(self.tabs[next_index].tab_id)
+
+    async def open_link_url(self, url: str) -> None:
+        """Open a clicked link inside Webterm."""
+
+        await self.browser.navigate(url)
+
+    async def action_focus_address(self) -> None:
+        address = self.query_one("#url", Input)
+        address.focus()
+        address.action_select_all()
+
+    async def action_new_tab(self) -> None:
+        await self.create_tab()
+
+    async def action_close_tab(self) -> None:
+        await self.close_current_tab()
+
+    async def action_reload(self) -> None:
+        await self.browser.reload()
+
+    async def action_back(self) -> None:
+        await self.browser.go_back()
+
+    async def action_forward(self) -> None:
+        await self.browser.go_forward()
+
+    @on(Input.Submitted, "#url")
+    async def address_submitted(self, event: Input.Submitted) -> None:
+        await self.browser.navigate(event.value)
+
+    @on(Button.Pressed)
+    async def button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
 
-        if button_id == "go":
-            await self.open_address()
-        elif button_id == "home":
-            await self.browser.navigate(core.HOME_URL)
-        elif button_id == "back":
+        if button_id == "back":
             await self.browser.go_back()
         elif button_id == "forward":
             await self.browser.go_forward()
+        elif button_id == "home":
+            await self.browser.navigate(core.HOME_URL)
         elif button_id == "reload":
             await self.browser.reload()
+        elif button_id == "go":
+            await self.browser.navigate(self.query_one("#url", Input).value)
         elif button_id == "new-tab":
-            await self.action_new_tab()
+            await self.create_tab()
         elif button_id.startswith("tab-"):
             try:
-                await self.activate_tab(int(button_id.removeprefix("tab-")))
+                await self.switch_tab(int(button_id.removeprefix("tab-")))
             except ValueError:
                 pass
         elif button_id.startswith("submit-form-"):
@@ -208,55 +343,11 @@ class Webterm(App):
             except ValueError:
                 pass
 
-    async def action_focus_address(self) -> None:
-        self.query_one("#url", Input).focus()
-
-    async def action_new_tab(self) -> None:
-        tab = self.create_tab()
-        await self.refresh_tabbar()
-        self.query_one("#url", Input).value = ""
-        self.query_one("#page-text", Static).update("New tab")
-        await self.browser.render_forms(tab)
-        self.query_one("#url", Input).focus()
-
-    async def action_close_tab(self) -> None:
-        if len(self.tabs) == 1:
-            tab = self.active_tab
-            if tab:
-                tab.url = ""
-                tab.title = "New Tab"
-                tab.content = ""
-                tab.links.clear()
-                tab.forms.clear()
-                self.query_one("#url", Input).value = ""
-                self.query_one("#page-text", Static).update("New tab")
-                await self.browser.render_forms(tab)
-            return
-
-        self.tabs = [t for t in self.tabs if t.tab_id != self.active_tab_id]
-        if self.tabs:
-            await self.activate_tab(self.tabs[-1].tab_id)
-
-    async def action_reload_page(self) -> None:
-        await self.browser.reload()
-
-    async def action_go_back(self) -> None:
-        await self.browser.go_back()
-
-    async def action_go_forward(self) -> None:
-        await self.browser.go_forward()
-
     async def on_unmount(self) -> None:
         for tab in self.tabs:
-            try:
-                tab.js.close()
-            except Exception:
-                pass
-
-
-def main() -> None:
-    Webterm().run()
-
-
-if __name__ == "__main__":
-    main()
+            if tab.js is not None:
+                try:
+                    tab.js.close()
+                except Exception:
+                    pass
+                tab.js = None

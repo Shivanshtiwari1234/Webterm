@@ -7,8 +7,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
-
-LANDING_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LANDING_DIR = PROJECT_ROOT / "landing"
 
 
 class QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
