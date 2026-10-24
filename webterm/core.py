@@ -1,5 +1,4 @@
-
-"""Webterm core: URL handling, HTTP fetching, and HTML parsing."""
+"""Webterm core: URL handling, HTTP fetching, HTML parsing, and JavaScript."""
 
 from __future__ import annotations
 
@@ -9,10 +8,12 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 from rich.text import Text
 
+from .javascript import JavaScriptRuntime
+
 
 HOME_URL = "https://duckduckgo.com/"
 SEARCH_URL = "https://html.duckduckgo.com/html/?q={}"
-USER_AGENT = "Webterm/0.3 (terminal web browser)"
+USER_AGENT = "Webterm/0.4 (terminal web browser)"
 
 
 def normalize_address(value: str) -> str:
@@ -30,9 +31,6 @@ def normalize_address(value: str) -> str:
     ):
         return SEARCH_URL.format(quote_plus(value))
 
-    if not value.split(":", 1)[0].isalpha() and "://" in value:
-        raise ValueError("Invalid URL scheme.")
-
     if "://" not in value:
         value = "https://" + value
 
@@ -44,6 +42,11 @@ def normalize_address(value: str) -> str:
         or not parsed.hostname
     ):
         raise ValueError("Only valid HTTP and HTTPS URLs are supported.")
+
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid port in URL.") from exc
 
     return value
 
@@ -70,15 +73,68 @@ async def fetch_page(url: str) -> tuple[str, str]:
         return str(response.url), response.text
 
 
+def execute_inline_scripts(
+    soup: BeautifulSoup,
+    runtime: JavaScriptRuntime,
+) -> list[str]:
+    """Execute inline scripts in document order and return new console output.
+
+    Scripts are removed from the soup after extraction so they do not appear
+    as visible page content. External scripts are skipped.
+    """
+    previous_count = len(runtime.console_messages)
+
+    for script in soup.find_all("script"):
+        source = script.string or script.get_text()
+
+        # Do not fetch or execute external scripts in this first version.
+        if script.has_attr("src"):
+            script.decompose()
+            continue
+
+        script_type = str(script.get("type", "")).strip().lower()
+
+        # Ignore non-JavaScript script types, such as JSON-LD.
+        if script_type and script_type not in (
+            "text/javascript",
+            "application/javascript",
+            "text/ecmascript",
+            "application/ecmascript",
+            "module",
+        ):
+            script.decompose()
+            continue
+
+        if source.strip():
+            runtime.execute(source)
+
+        script.decompose()
+
+    return runtime.console_messages[previous_count:]
+
+
 def parse_page(
     html: str,
     base_url: str,
+    runtime: JavaScriptRuntime | None = None,
 ) -> tuple[Text, dict[int, str], str]:
-    """Convert HTML into readable terminal text and numbered links."""
+    """Convert HTML into readable terminal text and numbered links.
+
+    When a runtime is provided, inline JavaScript is executed in that
+    runtime before the visible page content is rendered.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
+    js_messages: list[str] = []
+
+    if runtime is not None:
+        js_messages = execute_inline_scripts(soup, runtime)
+    else:
+        for script in soup.find_all("script"):
+            script.decompose()
+
     for element in soup(
-        ["script", "style", "noscript", "svg", "iframe", "template"]
+        ["style", "noscript", "svg", "iframe", "template"]
     ):
         element.decompose()
 
@@ -151,6 +207,13 @@ def parse_page(
         output.append(
             soup.get_text("\n", strip=True) or "No readable text found."
         )
+
+    if js_messages:
+        output.append("\n" + "─" * 68 + "\n", style="dim")
+        output.append("JAVASCRIPT CONSOLE\n\n", style="bold bright_magenta")
+
+        for message in js_messages:
+            output.append(message + "\n", style="bright_black")
 
     output.append("\n" + "─" * 68 + "\n", style="dim")
     output.append(

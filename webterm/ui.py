@@ -1,5 +1,4 @@
-
-"""Webterm UI: Textual application, tabs, and navigation."""
+"""Webterm UI: Textual application, tabs, navigation, and JavaScript."""
 
 from __future__ import annotations
 
@@ -13,6 +12,7 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Footer, Header, Input, Static
 
 from .core import HOME_URL, fetch_page, normalize_address, parse_page
+from .javascript import JavaScriptRuntime
 
 
 CSS = """
@@ -138,6 +138,8 @@ Footer {
 
 @dataclass
 class BrowserTab:
+    """State and JavaScript runtime belonging to one browser tab."""
+
     tab_id: int
     title: str = "New Tab"
     url: str = ""
@@ -151,6 +153,11 @@ class BrowserTab:
     back_stack: list[str] = field(default_factory=list)
     forward_stack: list[str] = field(default_factory=list)
     loading: bool = False
+    js: JavaScriptRuntime = field(
+        default_factory=JavaScriptRuntime,
+        repr=False,
+        compare=False,
+    )
 
 
 class Webterm(App[None]):
@@ -182,9 +189,13 @@ class Webterm(App[None]):
 
     @property
     def active_tab(self) -> BrowserTab:
-        return next(t for t in self.tabs if t.tab_id == self.active_tab_id)
+        return next(
+            tab for tab in self.tabs
+            if tab.tab_id == self.active_tab_id
+        )
 
     def create_tab_state(self) -> BrowserTab:
+        """Create a tab with its own JavaScript worker."""
         tab = BrowserTab(tab_id=self.next_tab_id)
         self.next_tab_id += 1
         self.tabs.append(tab)
@@ -193,8 +204,10 @@ class Webterm(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
+
         with Horizontal(id="tabbar"):
             pass
+
         with Horizontal(id="toolbar"):
             yield Button("‹", id="back", classes="nav-button")
             yield Button("›", id="forward", classes="nav-button")
@@ -204,9 +217,12 @@ class Webterm(App[None]):
                 placeholder="Search or enter website address",
                 id="url",
             )
+
         yield Static("Ready", id="status")
+
         with VerticalScroll(id="viewport"):
             yield Static("", id="page")
+
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -214,45 +230,83 @@ class Webterm(App[None]):
         self.render_active_tab()
         self.query_one("#url", Input).focus()
 
+    async def on_unmount(self) -> None:
+        """Clean up every tab's JavaScript worker when the app exits."""
+        for tab in self.tabs:
+            tab.js.close()
+
     def show_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
 
     def render_active_tab(self) -> None:
+        """Render the selected tab's saved page state."""
         tab = self.active_tab
+
         self.query_one("#page", Static).update(tab.content)
         self.query_one("#url", Input).value = tab.url
-        self.query_one("#viewport", VerticalScroll).scroll_home(animate=False)
+        self.query_one("#viewport", VerticalScroll).scroll_home(
+            animate=False
+        )
+
         if tab.url:
-            self.show_status(f"{tab.title}  ·  {len(tab.links)} links")
+            self.show_status(
+                f"{tab.title}  ·  {len(tab.links)} links"
+            )
         else:
             self.show_status("Ready")
 
     async def refresh_tabbar(self) -> None:
+        """Rebuild the tab strip."""
         bar = self.query_one("#tabbar", Horizontal)
         await bar.remove_children()
 
         for tab in self.tabs:
             label = tab.title.strip() or "New Tab"
+
             if len(label) > 22:
                 label = label[:21] + "…"
 
-            classes = "tab-item active" if tab.tab_id == self.active_tab_id else "tab-item"
+            classes = (
+                "tab-item active"
+                if tab.tab_id == self.active_tab_id
+                else "tab-item"
+            )
+
             item = Horizontal(
                 id=f"tab-item-{tab.tab_id}",
                 classes=classes,
             )
+
             await bar.mount(item)
+
             await item.mount(
-                Button(label, id=f"tab-{tab.tab_id}", classes="tab",
-                       tooltip=tab.url or "New Tab"),
-                Button("×", id=f"close-{tab.tab_id}", classes="close-tab",
-                       tooltip="Close tab"),
+                Button(
+                    label,
+                    id=f"tab-{tab.tab_id}",
+                    classes="tab",
+                    tooltip=tab.url or "New Tab",
+                ),
+                Button(
+                    "×",
+                    id=f"close-{tab.tab_id}",
+                    classes="close-tab",
+                    tooltip="Close tab",
+                ),
             )
 
-        await bar.mount(Button("+", id="new-tab", tooltip="New tab"))
+        await bar.mount(
+            Button("+", id="new-tab", tooltip="New tab")
+        )
 
-    async def navigate(self, address: str, *, record_history: bool = True) -> None:
+    async def navigate(
+        self,
+        address: str,
+        *,
+        record_history: bool = True,
+    ) -> None:
+        """Navigate the active tab and execute its inline scripts."""
         tab = self.active_tab
+
         if tab.loading:
             self.show_status("This tab is already loading.")
             return
@@ -266,34 +320,48 @@ class Webterm(App[None]):
         if not url:
             return
 
+        # A number selects a link from the current page.
         if url.isdigit():
             target = tab.links.get(int(url))
+
             if target:
                 await self.navigate(target)
             else:
                 self.show_status(f"No link numbered {url}.")
+
             return
 
         tab.loading = True
         self.show_status(f"Loading {url} ...")
+
         try:
             final_url, html = await fetch_page(url)
-            content, links, title = parse_page(html, final_url)
+
+            # Execute inline scripts in this tab's separate JS worker.
+            content, links, title = parse_page(
+                html,
+                final_url,
+                runtime=tab.js,
+            )
 
             if record_history and tab.url and final_url != tab.url:
                 tab.back_stack.append(tab.url)
                 tab.forward_stack.clear()
 
-            tab.url, tab.title = final_url, title
-            tab.content, tab.links = content, links
+            tab.url = final_url
+            tab.title = title
+            tab.content = content
+            tab.links = links
 
             if tab.tab_id == self.active_tab_id:
                 self.render_active_tab()
+
             await self.refresh_tabbar()
 
         except Exception as exc:
             if tab.tab_id == self.active_tab_id:
                 self.show_status(f"Error: {exc}")
+
         finally:
             tab.loading = False
 
@@ -302,37 +370,58 @@ class Webterm(App[None]):
         await self.navigate(event.value)
 
     @on(Button.Pressed)
-    async def button_pressed(self, event: Button.Pressed) -> None:
+    async def button_pressed(
+        self,
+        event: Button.Pressed,
+    ) -> None:
         button_id = event.button.id or ""
+
         if button_id == "new-tab":
             await self.action_new_tab()
+
         elif button_id == "back":
             await self.action_back()
+
         elif button_id == "forward":
             await self.action_forward()
+
         elif button_id == "reload":
             await self.action_reload()
+
         elif button_id == "home":
             await self.navigate(HOME_URL)
+
         elif button_id.startswith("close-"):
-            await self.close_tab(int(button_id.removeprefix("close-")))
+            await self.close_tab(
+                int(button_id.removeprefix("close-"))
+            )
+
         elif button_id.startswith("tab-"):
-            await self.switch_tab(int(button_id.removeprefix("tab-")))
+            await self.switch_tab(
+                int(button_id.removeprefix("tab-"))
+            )
 
     async def action_new_tab(self) -> None:
         tab = self.create_tab_state()
+
         await self.refresh_tabbar()
         self.render_active_tab()
         self.query_one("#url", Input).focus()
         self.show_status(f"New tab {tab.tab_id}")
 
     async def close_tab(self, tab_id: int) -> None:
-        tab = next((t for t in self.tabs if t.tab_id == tab_id), None)
+        tab = next(
+            (item for item in self.tabs if item.tab_id == tab_id),
+            None,
+        )
+
         if tab is None:
             return
 
         if len(self.tabs) == 1:
-            tab.title, tab.url = "New Tab", ""
+            # Keep the final tab and its runtime, but reset its page.
+            tab.title = "New Tab"
+            tab.url = ""
             tab.content = Text(
                 "Webterm\n\nEnter a URL above to start browsing.",
                 style="bright_cyan",
@@ -340,54 +429,81 @@ class Webterm(App[None]):
             tab.links.clear()
             tab.back_stack.clear()
             tab.forward_stack.clear()
+
         else:
             index = self.tabs.index(tab)
             self.tabs.remove(tab)
+
+            # The removed tab no longer needs a JS worker.
+            tab.js.close()
+
             if self.active_tab_id == tab_id:
-                self.active_tab_id = self.tabs[min(index, len(self.tabs) - 1)].tab_id
+                new_index = min(index, len(self.tabs) - 1)
+                self.active_tab_id = self.tabs[new_index].tab_id
 
         await self.refresh_tabbar()
         self.render_active_tab()
 
     async def switch_tab(self, tab_id: int) -> None:
-        if any(t.tab_id == tab_id for t in self.tabs):
+        if any(tab.tab_id == tab_id for tab in self.tabs):
             self.active_tab_id = tab_id
             await self.refresh_tabbar()
             self.render_active_tab()
 
     async def action_back(self) -> None:
         tab = self.active_tab
+
         if tab.loading or not tab.back_stack:
             self.show_status("No previous page.")
             return
+
         previous = tab.back_stack.pop()
+
         if tab.url:
             tab.forward_stack.append(tab.url)
+
         await self.navigate(previous, record_history=False)
 
     async def action_forward(self) -> None:
         tab = self.active_tab
+
         if tab.loading or not tab.forward_stack:
             self.show_status("No next page.")
             return
+
         following = tab.forward_stack.pop()
+
         if tab.url:
             tab.back_stack.append(tab.url)
+
         await self.navigate(following, record_history=False)
 
     async def action_reload(self) -> None:
         if self.active_tab.url:
-            await self.navigate(self.active_tab.url, record_history=False)
+            await self.navigate(
+                self.active_tab.url,
+                record_history=False,
+            )
         else:
             self.show_status("Nothing to reload.")
 
     async def action_next_tab(self) -> None:
-        index = next(i for i, t in enumerate(self.tabs) if t.tab_id == self.active_tab_id)
-        await self.switch_tab(self.tabs[(index + 1) % len(self.tabs)].tab_id)
+        index = next(
+            i for i, tab in enumerate(self.tabs)
+            if tab.tab_id == self.active_tab_id
+        )
+
+        next_index = (index + 1) % len(self.tabs)
+        await self.switch_tab(self.tabs[next_index].tab_id)
 
     async def action_previous_tab(self) -> None:
-        index = next(i for i, t in enumerate(self.tabs) if t.tab_id == self.active_tab_id)
-        await self.switch_tab(self.tabs[(index - 1) % len(self.tabs)].tab_id)
+        index = next(
+            i for i, tab in enumerate(self.tabs)
+            if tab.tab_id == self.active_tab_id
+        )
+
+        previous_index = (index - 1) % len(self.tabs)
+        await self.switch_tab(self.tabs[previous_index].tab_id)
 
     def action_focus_url(self) -> None:
         url_input = self.query_one("#url", Input)
