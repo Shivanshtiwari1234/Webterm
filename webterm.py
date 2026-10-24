@@ -1,11 +1,11 @@
 
 #!/usr/bin/env python3
-"""Webterm: a lightweight terminal-based web browser."""
+"""Webterm — a lightweight, multi-tab terminal web browser."""
 
 from __future__ import annotations
 
-import asyncio
 import re
+from dataclasses import dataclass, field
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import httpx
@@ -14,41 +14,143 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.widgets import Footer, Header, Input, Static
+from textual.containers import Horizontal, VerticalScroll
+from textual.widgets import Button, Footer, Header, Input, Static
 
 
 APP_NAME = "Webterm"
+HOME_URL = "https://duckduckgo.com/"
 SEARCH_URL = "https://html.duckduckgo.com/html/?q={}"
-USER_AGENT = (
-    "Webterm/0.1 "
-    "(terminal browser; compatible HTML text rendering)"
-)
+USER_AGENT = "Webterm/0.3 (terminal web browser)"
+
 
 CSS = """
 Screen {
-    layout: vertical;
     background: #101318;
     color: #e6edf3;
 }
 
+Header {
+    height: 1;
+    background: #161b22;
+    color: #58a6ff;
+}
+
+#tabbar {
+    height: 2;
+    padding: 0 1;
+    background: #171b22;
+    align: left middle;
+    overflow: hidden;
+}
+
+.tab-item {
+    height: 2;
+    min-width: 10;
+    max-width: 30;
+    margin-right: 1;
+    padding: 0;
+    background: #252b34;
+}
+
+.tab-item.active {
+    background: #303844;
+    border-bottom: tall #58a6ff;
+}
+
+.tab {
+    width: 1fr;
+    min-width: 6;
+    height: 2;
+    padding: 0 1;
+    background: transparent;
+    color: #b1bac4;
+    border: none;
+    text-style: none;
+}
+
+.tab-item.active .tab {
+    color: #ffffff;
+    text-style: bold;
+}
+
+.close-tab {
+    width: 3;
+    min-width: 3;
+    height: 2;
+    padding: 0;
+    background: transparent;
+    color: #8b949e;
+    border: none;
+}
+
+.close-tab:hover {
+    background: #da3633;
+    color: white;
+}
+
+#new-tab {
+    width: 4;
+    min-width: 4;
+    height: 2;
+    margin-left: 0;
+    padding: 0;
+    background: transparent;
+    color: #58a6ff;
+    border: none;
+    text-style: bold;
+}
+
+#new-tab:hover {
+    background: #303844;
+}
+
+#toolbar {
+    height: 3;
+    padding: 0 1;
+    background: #1c2129;
+    align: left middle;
+}
+
+.nav-button {
+    width: 4;
+    min-width: 4;
+    height: 3;
+    margin-right: 1;
+    padding: 0;
+    background: transparent;
+    color: #c9d1d9;
+    border: none;
+}
+
+.nav-button:hover {
+    background: #303844;
+    color: #58a6ff;
+}
+
 #url {
-    margin: 0 1;
+    width: 1fr;
+    height: 3;
+    border: round #30363d;
+    background: #101318;
+}
+
+#url:focus {
     border: round #58a6ff;
 }
 
 #status {
     height: 1;
     padding: 0 1;
-    color: #8b949e;
     background: #171b22;
+    color: #8b949e;
 }
 
 #viewport {
     height: 1fr;
-    border: round #30363d;
     margin: 0 1;
     padding: 1 2;
+    border: round #30363d;
 }
 
 #page {
@@ -57,70 +159,187 @@ Screen {
     padding-bottom: 1;
 }
 
-Header {
-    background: #161b22;
-    color: #58a6ff;
-}
-
 Footer {
+    height: 1;
     background: #161b22;
 }
 """
 
 
-class Webterm(App[None]):
-    """A small, keyboard-driven terminal browser."""
+@dataclass
+class BrowserTab:
+    tab_id: int
+    title: str = "New Tab"
+    url: str = ""
+    content: Text = field(
+        default_factory=lambda: Text(
+            "Webterm\n\nEnter a URL above to start browsing.",
+            style="bright_cyan",
+        )
+    )
+    links: dict[int, str] = field(default_factory=dict)
+    back_stack: list[str] = field(default_factory=list)
+    forward_stack: list[str] = field(default_factory=list)
+    loading: bool = False
 
+
+class Webterm(App[None]):
     TITLE = "Webterm"
     SUB_TITLE = "Terminal Web Browser"
     CSS = CSS
 
     BINDINGS = [
-        Binding("ctrl+l", "focus_url", "URL", show=True),
-        Binding("ctrl+b", "back", "Back", show=True),
-        Binding("ctrl+f", "forward", "Forward", show=True),
-        Binding("ctrl+r", "reload", "Reload", show=True),
+        Binding("ctrl+l", "focus_url", "Address bar"),
+        Binding("ctrl+t", "new_tab", "New tab"),
+        Binding("ctrl+w", "close_tab", "Close tab"),
+        Binding("ctrl+tab", "next_tab", "Next tab"),
+        Binding(
+            "ctrl+shift+tab",
+            "previous_tab",
+            "Previous tab",
+        ),
+        Binding("ctrl+b", "back", "Back"),
+        Binding("ctrl+f", "forward", "Forward"),
+        Binding("ctrl+r", "reload", "Reload"),
+        Binding("alt+left", "back", "Back", show=False),
+        Binding("alt+right", "forward", "Forward", show=False),
         Binding("escape", "focus_page", "Page", show=False),
-        Binding("q", "quit", "Quit", show=True),
+        Binding("q", "quit", "Quit"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
-        self.current_url = ""
-        self.back_stack: list[str] = []
-        self.forward_stack: list[str] = []
-        self.links: dict[int, str] = {}
-        self.loading = False
+        self.tabs: list[BrowserTab] = []
+        self.active_tab_id = 0
+        self.next_tab_id = 1
+        self.create_tab_state()
+
+    @property
+    def active_tab(self) -> BrowserTab:
+        return next(
+            tab for tab in self.tabs
+            if tab.tab_id == self.active_tab_id
+        )
+
+    def create_tab_state(self) -> BrowserTab:
+        tab = BrowserTab(tab_id=self.next_tab_id)
+        self.next_tab_id += 1
+        self.tabs.append(tab)
+        self.active_tab_id = tab.tab_id
+        return tab
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Input(
-            placeholder=(
-                "URL, search query, or link number "
-                "(Ctrl+L to focus)"
-            ),
-            id="url",
-        )
-        yield Static("Ready. Enter a URL to start browsing.", id="status")
+
+        with Horizontal(id="tabbar"):
+            pass
+
+        with Horizontal(id="toolbar"):
+            yield Button(
+                "‹",
+                id="back",
+                classes="nav-button",
+                tooltip="Back (Ctrl+B)",
+            )
+            yield Button(
+                "›",
+                id="forward",
+                classes="nav-button",
+                tooltip="Forward (Ctrl+F)",
+            )
+            yield Button(
+                "↻",
+                id="reload",
+                classes="nav-button",
+                tooltip="Reload (Ctrl+R)",
+            )
+            yield Button(
+                "⌂",
+                id="home",
+                classes="nav-button",
+                tooltip="Home",
+            )
+            yield Input(
+                placeholder="Search or enter website address",
+                id="url",
+            )
+
+        yield Static("Ready", id="status")
+
         with VerticalScroll(id="viewport"):
             yield Static("", id="page")
+
         yield Footer()
 
     async def on_mount(self) -> None:
+        await self.refresh_tabbar()
+        self.render_active_tab()
         self.query_one("#url", Input).focus()
-        self.show_message(
-            "Ready | Enter a URL or search query. "
-            "Type a link number to open it."
+        self.show_status(
+            "Ready  ·  Ctrl+T new tab  ·  Ctrl+W close tab"
         )
 
-    def show_message(self, message: str) -> None:
+    def show_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
 
-    def show_page(self, content: Text) -> None:
-        page = self.query_one("#page", Static)
-        page.update(content)
+    def render_active_tab(self) -> None:
+        tab = self.active_tab
+        self.query_one("#page", Static).update(tab.content)
+        self.query_one("#url", Input).value = tab.url
+
         self.query_one("#viewport", VerticalScroll).scroll_home(
             animate=False
+        )
+
+        if tab.url:
+            self.show_status(
+                f"{tab.title}  ·  {len(tab.links)} links"
+            )
+        else:
+            self.show_status("Ready")
+
+    async def refresh_tabbar(self) -> None:
+        bar = self.query_one("#tabbar", Horizontal)
+        await bar.remove_children()
+
+        for tab in self.tabs:
+            label = tab.title.strip() or "New Tab"
+            if len(label) > 22:
+                label = label[:21] + "…"
+
+            active_class = (
+                "tab-item active"
+                if tab.tab_id == self.active_tab_id
+                else "tab-item"
+            )
+
+            item = Horizontal(
+                id=f"tab-item-{tab.tab_id}",
+                classes=active_class,
+            )
+            await bar.mount(item)
+
+            await item.mount(
+                Button(
+                    label,
+                    id=f"tab-{tab.tab_id}",
+                    classes="tab",
+                    tooltip=tab.url or "New Tab",
+                ),
+                Button(
+                    "×",
+                    id=f"close-{tab.tab_id}",
+                    classes="close-tab",
+                    tooltip="Close tab",
+                ),
+            )
+
+        await bar.mount(
+            Button(
+                "+",
+                id="new-tab",
+                tooltip="Open a new tab (Ctrl+T)",
+            )
         )
 
     @staticmethod
@@ -130,22 +349,29 @@ class Webterm(App[None]):
         if not value:
             return ""
 
-        # Treat a number as a link selection, not a URL.
         if value.isdigit():
             return value
 
-        # Search queries, or strings without a hostname-like dot.
         if " " in value or (
             "://" not in value and "." not in value
         ):
             return SEARCH_URL.format(quote_plus(value))
 
-        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        if not re.match(
+            r"^[a-zA-Z][a-zA-Z0-9+.-]*://",
+            value,
+        ):
             value = "https://" + value
 
         parsed = urlparse(value)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError("Only valid HTTP and HTTPS URLs are supported.")
+
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.netloc
+        ):
+            raise ValueError(
+                "Only valid HTTP and HTTPS URLs are supported."
+            )
 
         return value
 
@@ -160,207 +386,371 @@ class Webterm(App[None]):
             response = await client.get(url)
             response.raise_for_status()
 
-            content_type = response.headers.get("content-type", "")
+            content_type = response.headers.get(
+                "content-type", ""
+            )
+
             if "html" not in content_type.lower():
                 raise ValueError(
-                    "This page is not HTML. "
-                    f"Content-Type: {content_type or 'unknown'}"
+                    "Not an HTML page: "
+                    f"{content_type or 'unknown type'}"
                 )
 
             return str(response.url), response.text
 
-    def parse_page(self, html: str, base_url: str) -> tuple[Text, dict[int, str], str]:
+    def parse_page(
+        self,
+        html: str,
+        base_url: str,
+    ) -> tuple[Text, dict[int, str], str]:
         soup = BeautifulSoup(html, "html.parser")
 
         for element in soup(
-            ["script", "style", "noscript", "svg", "iframe", "template"]
+            [
+                "script", "style", "noscript", "svg",
+                "iframe", "template",
+            ]
         ):
             element.decompose()
 
-        title = soup.title.get_text(" ", strip=True) if soup.title else ""
-        title = title or base_url
+        title = (
+            soup.title.get_text(" ", strip=True)
+            if soup.title
+            else ""
+        ) or base_url
 
-        output = Text()
-        output.append(f"{title}\n", style="bold bright_cyan")
-        output.append(f"{base_url}\n", style="dim")
-        output.append("=" * 72 + "\n\n", style="dim")
-
-        # Render the main content when possible.
-        main = soup.find("main") or soup.find("article") or soup.body or soup
-        block_tags = {
-            "h1", "h2", "h3", "h4", "p", "li", "blockquote",
-            "pre", "dt", "dd", "figcaption", "address",
-        }
+        main = (
+            soup.find("main")
+            or soup.find("article")
+            or soup.body
+            or soup
+        )
 
         links: dict[int, str] = {}
-        link_ids: dict[int, int] = {}
-        seen_blocks: set[int] = set()
 
         for anchor in main.find_all("a", href=True):
             href = str(anchor.get("href", "")).strip()
-            label = anchor.get_text(" ", strip=True) or href
 
-            if not href or href.startswith(("javascript:", "data:", "mailto:", "tel:")):
+            if not href or href.startswith(
+                ("javascript:", "data:", "mailto:", "tel:")
+            ):
                 continue
 
-            absolute = urljoin(base_url, href)
-            parsed = urlparse(absolute)
+            target = urljoin(base_url, href)
+            parsed = urlparse(target)
 
-            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.netloc
+            ):
                 continue
 
-            # Reuse the same number for repeated occurrences of a URL.
-            existing = next(
-                (number for number, target in links.items() if target == absolute),
-                None,
-            )
-            if existing is None:
-                existing = len(links) + 1
-                links[existing] = absolute
+            if target not in links.values():
+                links[len(links) + 1] = target
 
-            link_ids[id(anchor)] = existing
+        output = Text()
+        output.append(title + "\n", style="bold bright_cyan")
+        output.append(base_url + "\n", style="dim")
+        output.append("─" * 68 + "\n\n", style="dim")
 
-        for element in main.find_all(list(block_tags)):
-            # Avoid rendering a nested block twice.
+        block_tags = [
+            "h1", "h2", "h3", "h4", "p", "li",
+            "blockquote", "pre", "dt", "dd", "figcaption",
+        ]
+
+        rendered: set[int] = set()
+
+        for element in main.find_all(block_tags):
             if any(
-                id(parent) in seen_blocks
+                id(parent) in rendered
                 for parent in element.parents
                 if isinstance(parent, Tag)
             ):
                 continue
 
-            seen_blocks.add(id(element))
+            rendered.add(id(element))
             text = element.get_text(" ", strip=True)
 
             if not text:
                 continue
 
             if element.name.startswith("h"):
-                level = int(element.name[1])
-                output.append(text + "\n", style="bold bright_cyan")
-                output.append("\n")
+                output.append(
+                    text + "\n\n",
+                    style="bold bright_cyan",
+                )
             elif element.name == "li":
                 output.append("  • " + text + "\n")
             elif element.name == "blockquote":
-                output.append("  │ " + text + "\n", style="italic")
+                output.append(
+                    "  │ " + text + "\n",
+                    style="italic",
+                )
             elif element.name == "pre":
-                output.append(text + "\n", style="bright_black")
+                output.append(
+                    text + "\n",
+                    style="bright_black",
+                )
             else:
                 output.append(text + "\n\n")
 
         if not output.plain.strip():
             output.append(
-                soup.get_text("\n", strip=True) or "No readable page text found.",
-                style="white",
+                soup.get_text("\n", strip=True)
+                or "No readable text found."
             )
 
-        output.append("\n" + "=" * 72 + "\n", style="dim")
-        output.append(f"LINKS ({len(links)})\n\n", style="bold bright_yellow")
+        output.append("\n" + "─" * 68 + "\n", style="dim")
+        output.append(
+            f"LINKS ({len(links)})\n\n",
+            style="bold bright_yellow",
+        )
 
-        if links:
-            for number, target in links.items():
-                # Limit the visible URL width by allowing terminal wrapping.
-                output.append(f"[{number}] ", style="bold bright_green")
-                output.append(target + "\n", style="underline blue")
-        else:
-            output.append("No HTTP/HTTPS links found.\n", style="dim")
+        for number, target in links.items():
+            output.append(
+                f"[{number}] ",
+                style="bold bright_green",
+            )
+            output.append(
+                target + "\n",
+                style="underline blue",
+            )
+
+        if not links:
+            output.append("No links found.\n", style="dim")
 
         return output, links, title
 
-    async def navigate(self, address: str, *, record_history: bool = True) -> None:
-        if self.loading:
-            self.show_message("A request is already in progress.")
+    async def navigate(
+        self,
+        address: str,
+        *,
+        record_history: bool = True,
+    ) -> None:
+        tab = self.active_tab
+
+        if tab.loading:
+            self.show_status("This tab is already loading.")
             return
 
         try:
             url = self.normalize_address(address)
-
-            if not url:
-                return
-
-            if url.isdigit():
-                number = int(url)
-                target = self.links.get(number)
-                if target:
-                    await self.navigate(target)
-                else:
-                    self.show_message(f"No link numbered {number}.")
-                return
-
         except ValueError as exc:
-            self.show_message(str(exc))
+            self.show_status(str(exc))
             return
 
-        self.loading = True
-        self.show_message(f"Loading {url} ...")
-        self.query_one("#url", Input).value = url
+        if not url:
+            return
+
+        if url.isdigit():
+            target = tab.links.get(int(url))
+            if target:
+                await self.navigate(target)
+            else:
+                self.show_status(f"No link numbered {url}.")
+            return
+
+        tab.loading = True
+        self.show_status(f"Loading {url} ...")
 
         try:
             final_url, html = await self.fetch_page(url)
-            content, links, title = self.parse_page(html, final_url)
-
-            if record_history and self.current_url and final_url != self.current_url:
-                self.back_stack.append(self.current_url)
-                self.forward_stack.clear()
-
-            self.current_url = final_url
-            self.links = links
-            self.query_one("#url", Input).value = final_url
-            self.show_page(content)
-            self.show_message(
-                f"{title} | {final_url} | {len(links)} links"
+            content, links, title = self.parse_page(
+                html,
+                final_url,
             )
+
+            if (
+                record_history
+                and tab.url
+                and final_url != tab.url
+            ):
+                tab.back_stack.append(tab.url)
+                tab.forward_stack.clear()
+
+            tab.url = final_url
+            tab.title = title
+            tab.content = content
+            tab.links = links
+
+            if tab.tab_id == self.active_tab_id:
+                self.render_active_tab()
+
+            await self.refresh_tabbar()
 
         except (httpx.HTTPError, ValueError) as exc:
-            self.show_message(f"Error: {exc}")
+            if tab.tab_id == self.active_tab_id:
+                self.show_status(f"Error: {exc}")
         except Exception as exc:
-            self.show_message(
-                f"Could not render page: {type(exc).__name__}: {exc}"
-            )
+            if tab.tab_id == self.active_tab_id:
+                self.show_status(
+                    f"Could not render page: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         finally:
-            self.loading = False
+            tab.loading = False
 
     @on(Input.Submitted, "#url")
-    async def on_url_submitted(self, event: Input.Submitted) -> None:
+    async def submit_url(
+        self,
+        event: Input.Submitted,
+    ) -> None:
         await self.navigate(event.value)
 
-    async def action_back(self) -> None:
-        if not self.back_stack or self.loading:
-            self.show_message("No previous page.")
+    @on(Button.Pressed)
+    async def button_pressed(
+        self,
+        event: Button.Pressed,
+    ) -> None:
+        button_id = event.button.id or ""
+
+        if button_id == "new-tab":
+            await self.action_new_tab()
+        elif button_id == "back":
+            await self.action_back()
+        elif button_id == "forward":
+            await self.action_forward()
+        elif button_id == "reload":
+            await self.action_reload()
+        elif button_id == "home":
+            await self.navigate(HOME_URL)
+        elif button_id.startswith("close-"):
+            try:
+                await self.close_tab(
+                    int(button_id.removeprefix("close-"))
+                )
+            except ValueError:
+                pass
+        elif button_id.startswith("tab-"):
+            try:
+                await self.switch_tab(
+                    int(button_id.removeprefix("tab-"))
+                )
+            except ValueError:
+                pass
+
+    async def action_new_tab(self) -> None:
+        tab = self.create_tab_state()
+        await self.refresh_tabbar()
+        self.render_active_tab()
+        self.query_one("#url", Input).focus()
+        self.show_status(f"New tab {tab.tab_id}")
+
+    async def close_tab(self, tab_id: int) -> None:
+        tab = next(
+            (
+                item for item in self.tabs
+                if item.tab_id == tab_id
+            ),
+            None,
+        )
+
+        if tab is None:
             return
 
-        previous = self.back_stack.pop()
-        if self.current_url:
-            self.forward_stack.append(self.current_url)
+        if len(self.tabs) == 1:
+            tab.url = ""
+            tab.title = "New Tab"
+            tab.content = Text(
+                "Webterm\n\nEnter a URL above to start browsing.",
+                style="bright_cyan",
+            )
+            tab.links.clear()
+            tab.back_stack.clear()
+            tab.forward_stack.clear()
 
-        await self.navigate(previous, record_history=False)
+            await self.refresh_tabbar()
+            self.render_active_tab()
+            return
+
+        index = self.tabs.index(tab)
+        self.tabs.remove(tab)
+
+        if self.active_tab_id == tab_id:
+            new_index = min(index, len(self.tabs) - 1)
+            self.active_tab_id = self.tabs[new_index].tab_id
+
+        await self.refresh_tabbar()
+        self.render_active_tab()
+
+    async def switch_tab(self, tab_id: int) -> None:
+        if not any(
+            tab.tab_id == tab_id for tab in self.tabs
+        ):
+            return
+
+        self.active_tab_id = tab_id
+        await self.refresh_tabbar()
+        self.render_active_tab()
+
+    async def action_back(self) -> None:
+        tab = self.active_tab
+
+        if tab.loading or not tab.back_stack:
+            self.show_status("No previous page.")
+            return
+
+        previous = tab.back_stack.pop()
+
+        if tab.url:
+            tab.forward_stack.append(tab.url)
+
+        await self.navigate(
+            previous,
+            record_history=False,
+        )
 
     async def action_forward(self) -> None:
-        if not self.forward_stack or self.loading:
-            self.show_message("No next page.")
+        tab = self.active_tab
+
+        if tab.loading or not tab.forward_stack:
+            self.show_status("No next page.")
             return
 
-        following = self.forward_stack.pop()
-        if self.current_url:
-            self.back_stack.append(self.current_url)
+        following = tab.forward_stack.pop()
 
-        await self.navigate(following, record_history=False)
+        if tab.url:
+            tab.back_stack.append(tab.url)
+
+        await self.navigate(
+            following,
+            record_history=False,
+        )
 
     async def action_reload(self) -> None:
-        if self.current_url:
-            await self.navigate(self.current_url, record_history=False)
+        if self.active_tab.url:
+            await self.navigate(
+                self.active_tab.url,
+                record_history=False,
+            )
         else:
-            self.show_message("Nothing to reload.")
+            self.show_status("Nothing to reload.")
+
+    async def action_next_tab(self) -> None:
+        index = next(
+            i for i, tab in enumerate(self.tabs)
+            if tab.tab_id == self.active_tab_id
+        )
+        next_index = (index + 1) % len(self.tabs)
+        await self.switch_tab(self.tabs[next_index].tab_id)
+
+    async def action_previous_tab(self) -> None:
+        index = next(
+            i for i, tab in enumerate(self.tabs)
+            if tab.tab_id == self.active_tab_id
+        )
+        previous_index = (index - 1) % len(self.tabs)
+        await self.switch_tab(
+            self.tabs[previous_index].tab_id
+        )
 
     def action_focus_url(self) -> None:
-        self.query_one("#url", Input).focus()
-        self.query_one("#url", Input).action_select_all()
+        url_input = self.query_one("#url", Input)
+        url_input.focus()
+        url_input.action_select_all()
 
     def action_focus_page(self) -> None:
         self.query_one("#viewport", VerticalScroll).focus()
-
-    def action_quit(self) -> None:
-        self.exit()
 
 
 if __name__ == "__main__":
