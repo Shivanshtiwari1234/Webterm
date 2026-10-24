@@ -1,11 +1,20 @@
+"""Webterm application entry point."""
 
-#!/usr/bin/env python3
-
-from webterm import Webterm
+from landing.server import LandingServer
+from webterm import core
+from webterm.ui import Webterm
 
 
 def main() -> None:
-    Webterm().run()
+    server = LandingServer()
+
+    try:
+        landing_url = server.start()
+        core.set_home_url(landing_url)
+
+        Webterm().run()
+    finally:
+        server.stop()
 
 
 if __name__ == "__main__":

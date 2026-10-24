@@ -21,361 +21,490 @@ from .javascript import JavaScriptRuntime
 
 HOME_URL = "https://duckduckgo.com/"
 SEARCH_URL = "https://html.duckduckgo.com/html/?q={}"
+
 USER_AGENT = "Webterm/0.5 (terminal web browser)"
+MAX_PAGE_SIZE = 5 * 1024 * 1024
+
+HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 
 @dataclass
 class FormField:
-    """A form control, including its initial HTML value."""
+    """A supported HTML form control."""
 
     index: int
     name: str
-    kind: str
-    label: str = ""
+    field_type: str = "text"
     value: str = ""
+    label: str = ""
+    placeholder: str = ""
     required: bool = False
     disabled: bool = False
-    readonly: bool = False
     checked: bool = False
-    placeholder: str = ""
     options: list[tuple[str, str]] = field(default_factory=list)
-    multiple: bool = False
-    min_value: str = ""
-    max_value: str = ""
-    pattern: str = ""
-    autocomplete: str = ""
 
 
 @dataclass
 class FormSpec:
-    """An HTML form and its controls."""
+    """A parsed HTML form and its controls."""
 
     index: int
     action: str
     method: str
-    enctype: str
     fields: list[FormField] = field(default_factory=list)
     submitters: list[FormField] = field(default_factory=list)
-    name: str = ""
-    identifier: str = ""
+    enctype: str = "application/x-www-form-urlencoded"
 
 
-def validate_http_url(url: str) -> str:
-    """Validate a URL before using it for navigation or form submission."""
-    parsed = urlparse(url)
+def validate_http_url(value: str) -> str:
+    """Validate and normalize an absolute HTTP(S) URL."""
 
-    if (
-        parsed.scheme.lower() not in ("http", "https")
-        or not parsed.hostname
-        or not parsed.netloc
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        raise ValueError("Only HTTP and HTTPS URLs without embedded credentials are supported.")
+    value = value.strip()
+
+    if not value:
+        raise ValueError("The URL is empty.")
+
+    if any(ord(char) < 32 for char in value):
+        raise ValueError("The URL contains control characters.")
+
+    if "://" not in value:
+        value = "https://" + value
 
     try:
-        _ = parsed.port
+        parsed = urlparse(value)
+        port = parsed.port
     except ValueError as exc:
-        raise ValueError("Invalid port in URL.") from exc
+        raise ValueError("Invalid URL or port.") from exc
 
-    return url
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Only HTTP and HTTPS URLs are supported.")
+
+    if not parsed.hostname or not parsed.netloc:
+        raise ValueError("Enter a valid hostname.")
+
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing embedded credentials are not supported.")
+
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Port must be between 1 and 65535.")
+
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc,
+            parsed.path or "/",
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+
+
+def set_home_url(url: str) -> None:
+    """Set the homepage, for example to the local landing server."""
+    global HOME_URL
+    HOME_URL = validate_http_url(url)
 
 
 def normalize_address(value: str) -> str:
-    """Convert user input into an HTTP(S) URL or a search URL."""
+    """Interpret address-bar input as a URL or a search query."""
+
     value = value.strip()
 
     if not value:
         return ""
 
-    if value.isdigit():
-        return value
+    if any(ord(char) < 32 for char in value):
+        raise ValueError("The address contains control characters.")
 
-    if " " in value or (
-        "://" not in value and "." not in value
-    ):
-        return SEARCH_URL.format(quote_plus(value))
-
+    # A plain hostname or an IP address should be treated as a URL.
     if "://" not in value:
+        looks_like_host = (
+            "." in value
+            and " " not in value
+            and not value.startswith(".")
+            and not value.endswith(".")
+        )
+
+        looks_like_localhost = value.startswith("localhost:")
+        looks_like_ipv6 = value.startswith("[") and "]" in value
+
+        if not looks_like_host and not looks_like_localhost and not looks_like_ipv6:
+            return SEARCH_URL.format(quote_plus(value))
+
         value = "https://" + value
 
     return validate_http_url(value)
 
 
 async def fetch_page(url: str) -> tuple[str, str]:
-    """Fetch an HTML page. Return its final URL and HTML source."""
-    validate_http_url(url)
-    timeout = httpx.Timeout(20.0, connect=10.0)
+    """Fetch an HTML page and return its final URL and decoded HTML."""
+
+    url = validate_http_url(url)
 
     async with httpx.AsyncClient(
         follow_redirects=True,
-        timeout=timeout,
+        timeout=HTTP_TIMEOUT,
         headers={"User-Agent": USER_AGENT},
     ) as client:
-        response = await client.get(url)
-        response.raise_for_status()
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
 
-        final_url = str(response.url)
-        validate_http_url(final_url)
+            content_type = response.headers.get("content-type", "").lower()
 
-        content_type = response.headers.get("content-type", "")
-        if "html" not in content_type.lower():
-            raise ValueError(
-                f"Not an HTML page: {content_type or 'unknown type'}"
-            )
+            if "html" not in content_type and "xhtml" not in content_type:
+                raise ValueError(
+                    f"Unsupported content type: "
+                    f"{content_type or 'unknown'}. Webterm currently displays HTML."
+                )
 
-        return final_url, response.text
+            content_length = response.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_PAGE_SIZE:
+                        raise ValueError("Page exceeds the 5 MiB size limit.")
+                except ValueError as exc:
+                    if "size limit" in str(exc):
+                        raise
+                    # An invalid Content-Length header is ignored.
 
+            chunks: list[bytes] = []
+            total = 0
 
-async def submit_form(
-    action: str,
-    method: str,
-    enctype: str,
-    values: list[tuple[str, str]],
-) -> tuple[str, str]:
-    """Submit an HTML form and return the final URL and HTML response.
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
 
-    Only GET and application/x-www-form-urlencoded POST are supported.
-    Redirects are followed only when the final destination remains HTTP(S).
-    """
-    action = validate_http_url(action)
-    method = method.upper()
-    enctype = enctype.lower().split(";", 1)[0].strip()
+                if total > MAX_PAGE_SIZE:
+                    raise ValueError("Page exceeds the 5 MiB size limit.")
 
-    if method not in ("GET", "POST"):
-        raise ValueError(f"Unsupported form method: {method}")
+                chunks.append(chunk)
 
-    if enctype != "application/x-www-form-urlencoded":
-        raise ValueError(
-            "Webterm currently supports only URL-encoded forms. "
-            "Multipart and plain-text forms are not supported."
-        )
+            raw = b"".join(chunks)
+            encoding = response.encoding or "utf-8"
 
-    timeout = httpx.Timeout(20.0, connect=10.0)
-    headers = {"User-Agent": USER_AGENT}
+            try:
+                html = raw.decode(encoding, errors="replace")
+            except LookupError:
+                html = raw.decode("utf-8", errors="replace")
 
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=timeout,
-        headers=headers,
-    ) as client:
-        if method == "GET":
-            parsed = urlparse(action)
-            query = urlencode(values, doseq=True)
-            destination = urlunparse(
-                parsed._replace(query=query)
-            )
-            response = await client.get(destination)
-        else:
-            response = await client.post(
-                action,
-                data=values,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded"
-                },
-            )
-
-        response.raise_for_status()
-
-        final_url = str(response.url)
-        validate_http_url(final_url)
-
-        content_type = response.headers.get("content-type", "")
-        if "html" not in content_type.lower():
-            raise ValueError(
-                f"Form response is not HTML: {content_type or 'unknown type'}"
-            )
-
-        return final_url, response.text
+            return str(response.url), html
 
 
-def _control_label(
-    control: Tag,
-    labels_by_id: dict[str, str],
-) -> str:
-    """Find a label associated with a form control."""
-    control_id = str(control.get("id", ""))
+def _script_is_executable(script: Tag) -> bool:
+    """Return whether an inline script uses a supported JavaScript type."""
 
-    if control_id and control_id in labels_by_id:
-        return labels_by_id[control_id]
+    script_type = str(script.get("type", "")).strip().lower()
 
-    parent_label = control.find_parent("label")
-    if parent_label:
-        clone = BeautifulSoup(str(parent_label), "html.parser")
-        for nested in clone.find_all(["input", "textarea", "select", "button"]):
-            nested.decompose()
-        return clone.get_text(" ", strip=True)
+    return script_type in {
+        "",
+        "text/javascript",
+        "application/javascript",
+        "text/ecmascript",
+        "application/ecmascript",
+    }
 
-    return str(control.get("aria-label", "")).strip()
+
+def execute_inline_scripts(
+    soup: BeautifulSoup,
+    runtime: JavaScriptRuntime,
+) -> None:
+    """Execute supported inline scripts and remove script elements."""
+
+    for script in list(soup.find_all("script")):
+        try:
+            source = script.string or script.get_text()
+
+            if not script.get("src") and _script_is_executable(script) and source.strip():
+                runtime.execute(source)
+        except Exception as exc:
+            try:
+                runtime.logs.append(f"[JavaScript error] {exc}")
+            except Exception:
+                pass
+        finally:
+            script.decompose()
+
+
+def _element_label(element: Tag) -> str:
+    """Find a useful label for a form control."""
+
+    identifier = element.get("id")
+
+    if identifier:
+        label = element.find_parent("label")
+        if label:
+            return label.get_text(" ", strip=True)
+
+    label = element.find_parent("label")
+    if label:
+        return label.get_text(" ", strip=True)
+
+    return str(element.get("aria-label") or element.get("name") or "")
 
 
 def parse_forms(html: str, base_url: str) -> list[FormSpec]:
-    """Extract supported HTML forms and their controls."""
+    """Extract common HTML forms and supported controls."""
+
     soup = BeautifulSoup(html, "html.parser")
     forms: list[FormSpec] = []
+    control_index = 0
 
     for form_index, form_tag in enumerate(soup.find_all("form")):
         assert isinstance(form_tag, Tag)
 
-        raw_action = str(form_tag.get("action", "")).strip()
-        action = urljoin(base_url, raw_action) if raw_action else base_url
-        action = validate_http_url(action)
+        action = urljoin(base_url, str(form_tag.get("action") or base_url))
+        method = str(form_tag.get("method") or "get").lower()
 
-        method = str(form_tag.get("method", "get")).strip().upper()
-        if method not in ("GET", "POST"):
-            method = method
+        if method not in {"get", "post"}:
+            method = "get"
 
         enctype = str(
-            form_tag.get(
-                "enctype",
-                "application/x-www-form-urlencoded",
-            )
-        ).strip().lower()
-
-        labels_by_id: dict[str, str] = {}
-        for label_tag in form_tag.find_all("label", attrs={"for": True}):
-            target_id = str(label_tag.get("for", ""))
-            if target_id:
-                labels_by_id[target_id] = label_tag.get_text(" ", strip=True)
+            form_tag.get("enctype") or "application/x-www-form-urlencoded"
+        ).lower()
 
         spec = FormSpec(
             index=form_index,
             action=action,
             method=method,
             enctype=enctype,
-            name=str(form_tag.get("name", "")),
-            identifier=str(form_tag.get("id", "")),
         )
 
-        control_index = 0
+        # Associated external controls using form="id" are not handled here.
+        for element in form_tag.find_all(["input", "textarea", "select", "button"]):
+            assert isinstance(element, Tag)
 
-        for control in form_tag.find_all(
-            ["input", "textarea", "select", "button"]
-        ):
-            if not isinstance(control, Tag):
-                continue
+            if element.has_attr("disabled"):
+                disabled = True
+            else:
+                disabled = False
 
-            # Ignore controls belonging to a nested form, if malformed HTML
-            # caused the parser to retain one.
-            if control.find_parent("form") is not form_tag:
-                continue
-
-            tag_name = control.name.lower()
-            input_type = str(control.get("type", "text")).lower()
+            tag_name = element.name
+            name = str(element.get("name") or "")
 
             if tag_name == "input":
-                kind = input_type
+                field_type = str(element.get("type") or "text").lower()
+
+                if field_type in {
+                    "hidden",
+                    "text",
+                    "search",
+                    "email",
+                    "url",
+                    "tel",
+                    "number",
+                    "password",
+                    "checkbox",
+                    "radio",
+                    "submit",
+                    "reset",
+                    "button",
+                }:
+                    pass
+                else:
+                    continue
+
+                value = str(element.get("value") or "")
+                checked = element.has_attr("checked")
+                placeholder = str(element.get("placeholder") or "")
+                required = element.has_attr("required")
+
+                if field_type in {"submit", "reset", "button"}:
+                    if field_type == "submit" and not disabled:
+                        spec.submitters.append(
+                            FormField(
+                                index=control_index,
+                                name=name,
+                                field_type=field_type,
+                                value=value or "Submit",
+                                label=_element_label(element),
+                                disabled=disabled,
+                            )
+                        )
+                    control_index += 1
+                    continue
+
+                if field_type == "hidden" and not name:
+                    control_index += 1
+                    continue
+
+                item = FormField(
+                    index=control_index,
+                    name=name,
+                    field_type=field_type,
+                    value=value,
+                    label=_element_label(element),
+                    placeholder=placeholder,
+                    required=required,
+                    disabled=disabled,
+                    checked=checked,
+                )
+
             elif tag_name == "textarea":
-                kind = "textarea"
+                item = FormField(
+                    index=control_index,
+                    name=name,
+                    field_type="textarea",
+                    value=element.get_text(),
+                    label=_element_label(element),
+                    placeholder=str(element.get("placeholder") or ""),
+                    required=element.has_attr("required"),
+                    disabled=disabled,
+                )
+
             elif tag_name == "select":
-                kind = "select"
-            else:
-                kind = str(control.get("type", "submit")).lower()
+                options: list[tuple[str, str]] = []
 
-            if kind in ("image", "file"):
-                # File uploads and image-submit coordinates are not supported.
-                continue
-
-            if kind not in (
-                "text", "search", "email", "password", "url", "tel",
-                "number", "hidden", "checkbox", "radio", "submit",
-                "reset", "button", "textarea", "select",
-            ):
-                continue
-
-            name = str(control.get("name", ""))
-            value = str(control.get("value", ""))
-            checked = control.has_attr("checked")
-            disabled = control.has_attr("disabled")
-            required = control.has_attr("required")
-            readonly = control.has_attr("readonly")
-            label = _control_label(control, labels_by_id)
-
-            options: list[tuple[str, str]] = []
-            multiple = control.has_attr("multiple")
-
-            if kind == "textarea":
-                value = control.get_text()
-            elif kind == "select":
-                value = ""
-                for option in control.find_all("option"):
+                for option in element.find_all("option"):
                     option_value = str(
-                        option.get("value", option.get_text(" ", strip=True))
+                        option.get("value") or option.get_text(strip=True)
                     )
                     option_label = option.get_text(" ", strip=True)
-                    options.append((option_label, option_value))
-                    if option.has_attr("selected") and not value:
-                        value = option_value
-                if not value and not multiple and options:
-                    value = options[0][1]
-            elif kind == "checkbox" and not control.has_attr("value"):
-                value = "on"
-            elif kind == "radio" and not control.has_attr("value"):
-                value = "on"
-            elif tag_name == "button" and not value:
-                value = control.get_text(" ", strip=True)
+                    options.append((option_value, option_label))
 
-            field_spec = FormField(
-                index=control_index,
-                name=name,
-                kind=kind,
-                label=label or name or kind.replace("_", " ").title(),
-                value=value,
-                required=required,
-                disabled=disabled,
-                readonly=readonly,
-                checked=checked,
-                placeholder=str(control.get("placeholder", "")),
-                options=options,
-                multiple=multiple,
-                min_value=str(control.get("min", "")),
-                max_value=str(control.get("max", "")),
-                pattern=str(control.get("pattern", "")),
-                autocomplete=str(control.get("autocomplete", "")),
-            )
+                selected = element.find("option", selected=True)
+                value = ""
+
+                if selected:
+                    value = str(
+                        selected.get("value") or selected.get_text(strip=True)
+                    )
+                elif options:
+                    value = options[0][0]
+
+                item = FormField(
+                    index=control_index,
+                    name=name,
+                    field_type="select",
+                    value=value,
+                    label=_element_label(element),
+                    required=element.has_attr("required"),
+                    disabled=disabled,
+                    options=options,
+                )
+
+            else:
+                # Buttons are submitters only when their type is submit.
+                button_type = str(element.get("type") or "submit").lower()
+
+                if button_type == "submit" and not disabled:
+                    spec.submitters.append(
+                        FormField(
+                            index=control_index,
+                            name=name,
+                            field_type="submit",
+                            value=str(element.get("value") or element.get_text(strip=True) or "Submit"),
+                            label=element.get_text(" ", strip=True),
+                            disabled=disabled,
+                        )
+                    )
+
+                control_index += 1
+                continue
+
+            spec.fields.append(item)
             control_index += 1
 
-            if kind in ("submit", "reset", "button"):
-                spec.submitters.append(field_spec)
-            elif kind != "hidden" or name:
-                spec.fields.append(field_spec)
-
-        forms.append(spec)
+        if spec.fields or spec.submitters:
+            forms.append(spec)
 
     return forms
 
 
-def execute_inline_scripts(
-    soup: BeautifulSoup,
-    runtime: JavaScriptRuntime,
+def validate_form(
+    form: FormSpec,
+    values: dict[int, str | bool],
 ) -> list[str]:
-    """Execute inline scripts in document order and return new console output."""
-    previous_count = len(runtime.console_messages)
+    """Perform basic required-field checks."""
 
-    for script in soup.find_all("script"):
-        source = script.string or script.get_text()
+    errors: list[str] = []
 
-        # External scripts are intentionally not fetched or executed.
-        if script.has_attr("src"):
-            script.decompose()
+    for item in form.fields:
+        if item.disabled or not item.required:
             continue
 
-        script_type = str(script.get("type", "")).strip().lower()
-        if script_type and script_type not in (
-            "text/javascript",
-            "application/javascript",
-            "text/ecmascript",
-            "application/ecmascript",
-        ):
-            script.decompose()
+        value = values.get(item.index, item.value)
+
+        if item.field_type == "checkbox":
+            if not value:
+                errors.append(f"{item.label or item.name or 'Checkbox'} is required.")
+        elif not str(value).strip():
+            errors.append(f"{item.label or item.name or 'Field'} is required.")
+
+    return errors
+
+
+async def submit_form(
+    form: FormSpec,
+    values: dict[int, str | bool],
+    base_url: str,
+    submitter: FormField | None = None,
+) -> tuple[str, str]:
+    """Submit a supported GET or URL-encoded POST form."""
+
+    errors = validate_form(form, values)
+    if errors:
+        raise ValueError("\n".join(errors))
+
+    action = urljoin(base_url, form.action)
+    action = validate_http_url(action)
+
+    data: list[tuple[str, str]] = []
+
+    for item in form.fields:
+        if item.disabled or not item.name:
             continue
 
-        if source.strip():
-            runtime.execute(source)
+        value = values.get(item.index, item.value)
 
-        script.decompose()
+        if item.field_type in {"checkbox", "radio"}:
+            if value:
+                data.append((item.name, item.value or "on"))
+        else:
+            data.append((item.name, str(value)))
 
-    return runtime.console_messages[previous_count:]
+    if submitter and submitter.name:
+        data.append((submitter.name, submitter.value))
+
+    method = form.method.lower()
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=HTTP_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
+        if method == "get":
+            parsed = urlparse(action)
+            existing = parse_qsl(parsed.query, keep_blank_values=True)
+            query = urlencode(existing + data)
+            action = urlunparse(parsed._replace(query=query))
+            response = await client.get(action)
+
+        elif method == "post":
+            if form.enctype != "application/x-www-form-urlencoded":
+                raise ValueError(
+                    "Only URL-encoded POST forms are supported. "
+                    "File uploads and multipart forms are not supported."
+                )
+
+            response = await client.post(action, data=data)
+
+        else:
+            raise ValueError(f"Unsupported form method: {method}")
+
+        response.raise_for_status()
+
+        content_type = response.headers.get("content-type", "").lower()
+
+        if "html" not in content_type and "xhtml" not in content_type:
+            raise ValueError(
+                f"Form returned unsupported content type: "
+                f"{content_type or 'unknown'}."
+            )
+
+        if len(response.content) > MAX_PAGE_SIZE:
+            raise ValueError("Response exceeds the 5 MiB size limit.")
+
+        return str(response.url), response.text
 
 
 def parse_page(
@@ -383,101 +512,78 @@ def parse_page(
     base_url: str,
     runtime: JavaScriptRuntime | None = None,
 ) -> tuple[Text, dict[int, str], str]:
-    """Convert HTML into readable terminal text and numbered links."""
+    """Render page text, numbered links, and JavaScript console output."""
+
     soup = BeautifulSoup(html, "html.parser")
-    js_messages: list[str] = []
 
     if runtime is not None:
-        js_messages = execute_inline_scripts(soup, runtime)
+        execute_inline_scripts(soup, runtime)
+        js_logs = "\n".join(getattr(runtime, "logs", []))
     else:
-        for script in soup.find_all("script"):
-            script.decompose()
+        js_logs = ""
 
     for element in soup(
-        ["style", "noscript", "svg", "iframe", "template"]
+        ["style", "noscript", "svg", "canvas", "iframe", "object", "embed"]
     ):
         element.decompose()
 
-    title = (
-        soup.title.get_text(" ", strip=True) if soup.title else ""
-    ) or base_url
-
-    main = soup.find("main") or soup.find("article") or soup.body or soup
     links: dict[int, str] = {}
+    output: list[str] = []
+    link_index = 1
 
-    for anchor in main.find_all("a", href=True):
-        href = str(anchor.get("href", "")).strip()
-
-        if not href or href.lower().startswith(
-            ("javascript:", "data:", "mailto:", "tel:")
-        ):
+    for element in soup.find_all(
+        ["h1", "h2", "h3", "h4", "p", "li", "pre", "blockquote", "a", "img", "br", "hr"]
+    ):
+        if not isinstance(element, Tag):
             continue
 
-        target = urljoin(base_url, href)
+        if element.name == "a":
+            href = element.get("href")
 
-        try:
-            validate_http_url(target)
-        except ValueError:
-            continue
+            if not href:
+                continue
 
-        if target not in links.values():
-            links[len(links) + 1] = target
+            absolute_url = urljoin(base_url, str(href))
+            label = element.get_text(" ", strip=True) or absolute_url
 
-    output = Text()
-    output.append(title + "\n", style="bold bright_cyan")
-    output.append(base_url + "\n", style="dim")
-    output.append("─" * 68 + "\n\n", style="dim")
+            links[link_index] = absolute_url
+            output.append(f"[{link_index}] {label} ({absolute_url})")
+            link_index += 1
 
-    block_tags = [
-        "h1", "h2", "h3", "h4", "h5", "h6",
-        "p", "li", "blockquote", "pre", "dt", "dd",
-        "figcaption", "legend",
-    ]
-    rendered: set[int] = set()
+        elif element.name == "img":
+            alt = str(element.get("alt") or "").strip()
+            if alt:
+                output.append(f"[Image: {alt}]")
 
-    for element in main.find_all(block_tags):
-        if any(
-            id(parent) in rendered
-            for parent in element.parents
-            if isinstance(parent, Tag)
-        ):
-            continue
+        elif element.name == "br":
+            output.append("")
 
-        rendered.add(id(element))
-        text = element.get_text(" ", strip=True)
-        if not text:
-            continue
+        elif element.name == "hr":
+            output.append("-" * 50)
 
-        if element.name.startswith("h") or element.name == "legend":
-            output.append(text + "\n\n", style="bold bright_cyan")
-        elif element.name == "li":
-            output.append("  • " + text + "\n")
-        elif element.name == "blockquote":
-            output.append("  │ " + text + "\n", style="italic")
+        elif element.name in {"h1", "h2", "h3", "h4"}:
+            text = element.get_text(" ", strip=True)
+            if text:
+                output.append(f"\n{text.upper()}\n")
+
         elif element.name == "pre":
-            output.append(text + "\n", style="bright_black")
+            text = element.get_text("\n", strip=True)
+            if text:
+                output.append(f"\n{text}\n")
+
         else:
-            output.append(text + "\n\n")
+            text = element.get_text(" ", strip=True)
+            if text:
+                output.append(text)
 
-    if not output.plain.strip():
-        output.append(
-            soup.get_text("\n", strip=True) or "No readable text found."
-        )
+    # Fall back to page text when no common structural elements were found.
+    if not output:
+        output = [soup.get_text("\n", strip=True)]
 
-    if js_messages:
-        output.append("\n" + "─" * 68 + "\n", style="dim")
-        output.append("JAVASCRIPT CONSOLE\n\n", style="bold bright_magenta")
-        for message in js_messages:
-            output.append(message + "\n", style="bright_black")
+    rendered = "\n".join(output).strip()
+    if not rendered:
+        rendered = "(This page contains no readable text.)"
 
-    output.append("\n" + "─" * 68 + "\n", style="dim")
-    output.append(f"LINKS ({len(links)})\n\n", style="bold bright_yellow")
+    page = Text(rendered)
 
-    for number, target in links.items():
-        output.append(f"[{number}] ", style="bold bright_green")
-        output.append(target + "\n", style="underline blue")
-
-    if not links:
-        output.append("No links found.\n", style="dim")
-
-    return output, links, title
+    return page, links, js_logs
