@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webterm"
+version = "0.1.0"
+description = "A lightweight, multi-tab web browser for the terminal"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Webterm contributors" }
+]
+keywords = [
+    "terminal",
+    "browser",
+    "tui",
+    "textual",
+    "web"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: Browsers"
+]
+dependencies = [
+    "textual>=0.70",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "rich>=13.7"
+]
+
+[project.scripts]
+webterm = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["webterm"]
