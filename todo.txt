@@ -2,6 +2,6 @@
 1. DOM tree and node travsersal -------------- [X]
 2. Document and element interfaces ----------- [X]
 3. CSS selectors ----------------------------- [X]
-4. JavaScript bindings ----------------------- [ ]
+4. JavaScript bindings ----------------------- [X]
 5. DOM mutations and renderer updates -------- [ ]
 6. Event handling ---------------------------- [ ]
