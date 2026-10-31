@@ -204,9 +204,21 @@ class DOMElement(DOMNode):
     def outer_html(self) -> str:
         return str(self._node)
 
+    def query_selector(self, selector: str) -> DOMElement | None:
+        """Return the first descendant matching a CSS selector."""
+        match = self._node.select_one(selector)
+        return self._document._wrap(match) if isinstance(match, Tag) else None
+
+    def query_selector_all(self, selector: str) -> list[DOMElement]:
+        """Return all descendants matching a CSS selector."""
+        return [
+            self._document._wrap(match)
+            for match in self._node.select(selector)
+        ]
+
 
 class DOMDocument(DOMNode):
-    """Parsed document with Document-style lookup and creation interfaces."""
+    """Parsed document with Document-style lookup and selector interfaces."""
 
     __slots__ = ("_soup",)
 
@@ -257,6 +269,18 @@ class DOMDocument(DOMNode):
         return [
             self._wrap(element)
             for element in self._soup.find_all(tag_name)
+        ]
+
+    def query_selector(self, selector: str) -> DOMElement | None:
+        """Return the first element matching a CSS selector."""
+        match = self._soup.select_one(selector)
+        return self._wrap(match) if isinstance(match, Tag) else None
+
+    def query_selector_all(self, selector: str) -> list[DOMElement]:
+        """Return all elements matching a CSS selector."""
+        return [
+            self._wrap(match)
+            for match in self._soup.select(selector)
         ]
 
     def create_element(self, tag_name: str) -> DOMElement:

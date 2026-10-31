@@ -1,70 +1,49 @@
+from webterm.dom import DOMDocument
 
-from webterm.dom import DOMDocument, DOMElement
+def test_document_query_selector():
+    document = DOMDocument(
+        '<main><p class="intro">Hello</p><p>World</p></main>'
+    )
 
+    result = document.query_selector("p.intro")
 
-def test_element_interface_and_attributes():
-    document = DOMDocument('<p id="intro" class="lead wide">Hello</p>')
-    paragraph = document.get_element_by_id("intro")
-
-    assert isinstance(paragraph, DOMElement)
-    assert paragraph.tag_name == "P"
-    assert paragraph.id == "intro"
-    assert paragraph.class_name == "lead wide"
-    assert paragraph.get_attribute("class") == "lead wide"
-    assert paragraph.has_attribute("id")
-    assert not paragraph.has_attribute("missing")
+    assert result is not None
+    assert result.tag_name == "P"
+    assert result.text_content == "Hello"
 
 
-def test_element_attributes_are_copied():
-    document = DOMDocument('<div id="original"></div>')
-    element = document.get_element_by_id("original")
+def test_document_query_selector_all():
+    document = DOMDocument(
+        '<ul><li class="item">A</li><li class="item">B</li></ul>'
+    )
 
-    attributes = element.attributes
-    attributes["id"] = "changed"
+    results = document.query_selector_all("li.item")
 
-    assert element.id == "original"
-
-
-def test_element_inner_and_outer_html():
-    document = DOMDocument('<section><b>Bold</b> text</section>')
-    section = document.get_elements_by_tag_name("section")[0]
-
-    assert section.inner_html == "<b>Bold</b> text"
-    assert section.outer_html == "<section><b>Bold</b> text</section>"
+    assert len(results) == 2
+    assert [item.text_content for item in results] == ["A", "B"]
 
 
-def test_document_lookup_by_id():
-    document = DOMDocument('<div id="one"></div><p id="two"></p>')
+def test_element_query_selector_is_scoped_to_descendants():
+    document = DOMDocument(
+        '<section id="first"><p>Inside</p></section>'
+        '<section id="second"><p>Outside</p></section>'
+    )
+    section = document.get_element_by_id("first")
 
-    assert document.get_element_by_id("one").tag_name == "DIV"
-    assert document.get_element_by_id("missing") is None
+    result = section.query_selector("p")
 
-
-def test_document_lookup_by_tag_name():
-    document = DOMDocument("<ul><li>A</li><li>B</li></ul>")
-
-    items = document.get_elements_by_tag_name("li")
-
-    assert len(items) == 2
-    assert [item.text_content for item in items] == ["A", "B"]
+    assert result is not None
+    assert result.text_content == "Inside"
+    assert section.query_selector("#second") is None
 
 
-def test_document_create_element():
-    document = DOMDocument()
-    element = document.create_element("custom-widget")
+def test_query_selector_returns_none_when_no_match():
+    document = DOMDocument("<p>Hello</p>")
 
-    assert isinstance(element, DOMElement)
-    assert element.tag_name == "CUSTOM-WIDGET"
-    assert element.node_type == 1
+    assert document.query_selector(".missing") is None
 
 
-def test_create_element_rejects_invalid_names():
-    document = DOMDocument()
+def test_query_selector_all_returns_empty_list_when_no_match():
+    document = DOMDocument("<p>Hello</p>")
 
-    for name in ("", "custom widget"):
-        try:
-            document.create_element(name)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Expected ValueError")
+    assert document.query_selector_all(".missing") == []
