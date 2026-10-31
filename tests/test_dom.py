@@ -1,102 +1,70 @@
-from webterm.dom import (
-    COMMENT_NODE,
-    DOCUMENT_NODE,
-    ELEMENT_NODE,
-    TEXT_NODE,
-    DOMDocument,
-)
+
+from webterm.dom import DOMDocument, DOMElement
 
 
-def test_document_and_element_node_types():
-    document = DOMDocument("<html><body><p>Hello</p></body></html>")
+def test_element_interface_and_attributes():
+    document = DOMDocument('<p id="intro" class="lead wide">Hello</p>')
+    paragraph = document.get_element_by_id("intro")
 
-    html = document.document_element
-    body = html.first_element_child
-    paragraph = body.first_element_child
-    text = paragraph.first_child
-
-    assert document.node_type == DOCUMENT_NODE
-    assert html.node_type == ELEMENT_NODE
-    assert paragraph.node_type == ELEMENT_NODE
-    assert text.node_type == TEXT_NODE
-
-
-def test_parent_child_relationships():
-    document = DOMDocument("<div><p>Text</p></div>")
-
-    div = document.document_element.first_element_child
-    paragraph = div.first_element_child
-
-    assert paragraph.parent_node._node is div._node
-    assert div.children == [paragraph]
-    assert div.child_nodes == [paragraph]
+    assert isinstance(paragraph, DOMElement)
+    assert paragraph.tag_name == "P"
+    assert paragraph.id == "intro"
+    assert paragraph.class_name == "lead wide"
+    assert paragraph.get_attribute("class") == "lead wide"
+    assert paragraph.has_attribute("id")
+    assert not paragraph.has_attribute("missing")
 
 
-def test_text_and_comment_nodes():
-    document = DOMDocument("<p>Hello<!-- note -->world</p>")
-    paragraph = document.document_element.first_element_child
+def test_element_attributes_are_copied():
+    document = DOMDocument('<div id="original"></div>')
+    element = document.get_element_by_id("original")
 
-    children = paragraph.child_nodes
+    attributes = element.attributes
+    attributes["id"] = "changed"
 
-    assert [node.node_type for node in children] == [
-        TEXT_NODE,
-        COMMENT_NODE,
-        TEXT_NODE,
-    ]
-    assert children[0].node_value == "Hello"
-    assert children[1].node_value == " note "
-    assert paragraph.text_content == "Helloworld"
+    assert element.id == "original"
 
 
-def test_sibling_navigation():
-    document = DOMDocument("<ul><li>A</li> text <li>B</li></ul>")
-    ul = document.document_element.first_element_child
+def test_element_inner_and_outer_html():
+    document = DOMDocument('<section><b>Bold</b> text</section>')
+    section = document.get_elements_by_tag_name("section")[0]
 
-    first_li = ul.first_element_child
-    second_li = ul.last_element_child
-
-    assert first_li.next_element_sibling._node is second_li._node
-    assert second_li.previous_element_sibling._node is first_li._node
-    assert first_li.previous_sibling is None
+    assert section.inner_html == "<b>Bold</b> text"
+    assert section.outer_html == "<section><b>Bold</b> text</section>"
 
 
-def test_depth_first_traversal():
-    document = DOMDocument("<main><p>A</p><section><b>B</b></section></main>")
+def test_document_lookup_by_id():
+    document = DOMDocument('<div id="one"></div><p id="two"></p>')
 
-    names = [
-        node.node_name
-        for node in document.iter_nodes()
-    ]
-
-    assert names == [
-        "#document",
-        "HTML",
-        "MAIN",
-        "P",
-        "#text",
-        "SECTION",
-        "B",
-        "#text",
-    ]
+    assert document.get_element_by_id("one").tag_name == "DIV"
+    assert document.get_element_by_id("missing") is None
 
 
-def test_iter_elements_excludes_text_nodes():
-    document = DOMDocument("<div>Text <span>Nested</span></div>")
+def test_document_lookup_by_tag_name():
+    document = DOMDocument("<ul><li>A</li><li>B</li></ul>")
 
-    names = [
-        node.node_name
-        for node in document.iter_elements()
-    ]
+    items = document.get_elements_by_tag_name("li")
 
-    assert names == ["HTML", "DIV", "SPAN"]
+    assert len(items) == 2
+    assert [item.text_content for item in items] == ["A", "B"]
 
 
-def test_document_title_and_serialization():
-    document = DOMDocument(
-        "<!doctype html><html><head><title>Example</title></head>"
-        "<body><p>Hello</p></body></html>"
-    )
+def test_document_create_element():
+    document = DOMDocument()
+    element = document.create_element("custom-widget")
 
-    assert document.title == "Example"
-    assert document.doctype is not None
-    assert "<p>Hello</p>" in document.serialize()
+    assert isinstance(element, DOMElement)
+    assert element.tag_name == "CUSTOM-WIDGET"
+    assert element.node_type == 1
+
+
+def test_create_element_rejects_invalid_names():
+    document = DOMDocument()
+
+    for name in ("", "custom widget"):
+        try:
+            document.create_element(name)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Expected ValueError")

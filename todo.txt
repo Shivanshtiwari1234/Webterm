@@ -1,6 +1,6 @@
 === TODO ===
 1. DOM tree and node travsersal -------------- [X]
-2. Document and element interfaces ----------- [ ]
+2. Document and element interfaces ----------- [X]
 3. CSS selectors ----------------------------- [ ]
 4. JavaScript bindings ----------------------- [ ]
 5. DOM mutations and renderer updates -------- [ ]
