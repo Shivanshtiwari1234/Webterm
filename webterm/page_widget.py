@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from rich.cells import cell_len
+from rich.cells import cell_len, split_graphemes
 from rich.text import Text
 from textual.widgets import Static
 
@@ -81,23 +81,24 @@ class ClickablePage(Static):
         if not line:
             return [(0, "")]
 
+        graphemes, _cell_length = split_graphemes(line)
         segments: list[tuple[int, str]] = []
         start = 0
 
-        while start < len(line):
+        while start < len(graphemes):
             end = start
             cells = 0
             last_space = -1
 
-            while end < len(line):
-                char_width = max(0, cell_len(line[end]))
+            while end < len(graphemes):
+                char_start, char_end, char_width = graphemes[end]
 
                 if cells + char_width > width and end > start:
                     break
 
                 cells += char_width
 
-                if line[end].isspace():
+                if line[char_start:char_end].isspace():
                     last_space = end
 
                 end += 1
@@ -105,16 +106,21 @@ class ClickablePage(Static):
                 if cells >= width:
                     break
 
-            if end < len(line) and last_space > start:
+            if end < len(graphemes) and last_space > start:
                 end = last_space
 
             if end <= start:
                 end = start + 1
 
-            segments.append((start, line[start:end]))
+            segment_start = graphemes[start][0]
+            segment_end = graphemes[end - 1][1]
+            segments.append((segment_start, line[segment_start:segment_end]))
             start = end
 
-            while start < len(line) and line[start] == " ":
+            while (
+                start < len(graphemes)
+                and line[graphemes[start][0]:graphemes[start][1]] == " "
+            ):
                 start += 1
 
         return segments or [(0, "")]
@@ -158,10 +164,9 @@ class ClickablePage(Static):
 
         used = 0
 
-        for offset, char in enumerate(segment):
-            width = max(0, cell_len(char))
+        for offset, _end, width in split_graphemes(segment)[0]:
 
-            if used <= column < used + max(1, width):
+            if width and used <= column < used + width:
                 return start + offset
 
             used += width
