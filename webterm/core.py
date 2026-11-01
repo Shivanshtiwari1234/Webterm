@@ -184,7 +184,7 @@ def execute_inline_scripts(
 
         if not script.get("src") and script_type in supported_types and source.strip():
             try:
-                runtime.execute(source)
+                runtime.execute(source, document_html=str(soup))
             except Exception as exc:
                 logs = getattr(runtime, "console_messages", None)
                 if isinstance(logs, list):
