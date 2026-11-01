@@ -49,7 +49,7 @@ def _javascript_worker(
             return nodes.get(int(node_id))
 
         def dom_call(operation: str, args_json: str) -> str:
-            """Perform a read-only DOM operation and return JSON."""
+            """Dispatch a DOM operation and return its JSON-encoded result."""
             try:
                 args = json.loads(args_json)
                 node_id = args.get("node")
@@ -63,6 +63,55 @@ def _javascript_worker(
                             register(document.document_element) if document else None
                         ),
                     })
+
+                if operation == "createElement":
+                    if document is None:
+                        return json.dumps(None)
+                    return json.dumps(register(document.create_element(args["tag"])))
+
+                if operation == "createTextNode":
+                    if document is None:
+                        return json.dumps(None)
+                    return json.dumps(register(document.create_text_node(args["text"])))
+
+                if operation == "appendChild":
+                    if not isinstance(node, DOMElement):
+                        raise TypeError("appendChild receiver must be an element")
+                    child = get_node(args["child"])
+                    if child is None:
+                        raise TypeError("appendChild child is not a valid node")
+                    node.append_child(child)
+                    return json.dumps(register(child))
+
+                if operation == "removeChild":
+                    if not isinstance(node, DOMElement):
+                        raise TypeError("removeChild receiver must be an element")
+                    child = get_node(args["child"])
+                    if child is None:
+                        raise TypeError("removeChild child is not a valid node")
+                    node.remove_child(child)
+                    return json.dumps(register(child))
+
+                if operation == "setProperty":
+                    if node is None:
+                        raise TypeError("Cannot set a property on a null node")
+                    name = args["name"]
+                    value = args.get("value")
+                    if name == "textContent":
+                        node.text_content = "" if value is None else str(value)
+                    elif name == "nodeValue":
+                        node.node_value = None if value is None else str(value)
+                    elif isinstance(node, DOMElement) and name == "id":
+                        node.id = "" if value is None else str(value)
+                    elif isinstance(node, DOMElement) and name == "className":
+                        node.class_name = "" if value is None else str(value)
+                    elif isinstance(node, DOMElement) and name == "innerHTML":
+                        node.inner_html = "" if value is None else str(value)
+                    elif isinstance(node, DOMElement) and name == "outerHTML":
+                        node.outer_html = "" if value is None else str(value)
+                    else:
+                        raise AttributeError(f"Unsupported DOM property: {name}")
+                    return json.dumps(True)
 
                 if operation == "getElementById":
                     result = document.get_element_by_id(args["id"]) if document else None
@@ -197,6 +246,9 @@ def _javascript_worker(
                 ]) {
                     Object.defineProperty(node, name, {
                         get: () => property(name),
+                        set: value => __domCall("setProperty", {
+                            node: id, name, value
+                        }),
                         configurable: true
                     });
                 }
@@ -218,6 +270,24 @@ def _javascript_worker(
                         configurable: true
                     });
                 }
+
+                node.appendChild = child => {
+                    if (!child || child.__id === undefined) {
+                        throw new TypeError("appendChild expects a DOM node");
+                    }
+                    return __wrapNode(__domCall("appendChild", {
+                        node: id, child: child.__id
+                    }));
+                };
+
+                node.removeChild = child => {
+                    if (!child || child.__id === undefined) {
+                        throw new TypeError("removeChild expects a DOM node");
+                    }
+                    return __wrapNode(__domCall("removeChild", {
+                        node: id, child: child.__id
+                    }));
+                };
 
                 node.getAttribute = name =>
                     __domCall("getAttribute", { node: id, name: String(name) });
@@ -243,6 +313,10 @@ def _javascript_worker(
                 get documentElement() {
                     return __wrapNode(__domCall("document").documentElement);
                 },
+                createElement: tag =>
+                    __wrapNode(__domCall("createElement", { tag: String(tag) })),
+                createTextNode: text =>
+                    __wrapNode(__domCall("createTextNode", { text: String(text) })),
                 getElementById: id =>
                     __wrapNode(__domCall("getElementById", { id: String(id) })),
                 getElementsByTagName: tag =>
@@ -289,6 +363,12 @@ def _javascript_worker(
             except Exception as exc:
                 conn.send(("error", str(exc)))
 
+            if document is not None:
+                try:
+                    conn.send(("document_html", document.serialize()))
+                except Exception as exc:
+                    conn.send(("error", f"Could not serialize DOM: {exc}"))
+
             conn.send(("done", None))
 
     except BaseException as exc:
@@ -320,6 +400,7 @@ class JavaScriptRuntime:
         self.memory_limit_mb = memory_limit_mb
         self.startup_timeout = startup_timeout
         self.console_messages: list[str] = []
+        self.document_html: str | None = None
         self._closed = False
 
         self._ctx = mp.get_context("spawn")
@@ -446,6 +527,7 @@ class JavaScriptRuntime:
 
         deadline = time.monotonic() + self.timeout
         result: str | None = None
+        self.document_html = None
 
         while time.monotonic() < deadline:
             if self._parent.poll(0.05):
@@ -464,6 +546,8 @@ class JavaScriptRuntime:
                     result = values[0]
                 elif kind == "error":
                     self.console_messages.append(f"[JavaScript error] {values[0]}")
+                elif kind == "document_html":
+                    self.document_html = values[0]
                 elif kind == "fatal":
                     self.console_messages.append(
                         f"[JavaScript worker error] {values[0]}"
