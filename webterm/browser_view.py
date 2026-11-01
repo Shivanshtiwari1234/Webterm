@@ -1,16 +1,24 @@
-"""Navigation, page state, history, and forms."""
+
+"""Navigation, page state, history, JavaScript events, and forms."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from rich.text import Text
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Checkbox, Input, Label, Select, Static, TextArea
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Input,
+    Label,
+    Select,
+    Static,
+    TextArea,
+)
 
-from . import core
 from .core import (
     FormSpec,
     fetch_page,
@@ -53,13 +61,12 @@ class BrowserView:
         return self.app.active_tab
 
     def status(self, message: str, tab: BrowserTab | None = None) -> None:
-        # Background tabs must not overwrite the visible tab's status.
         if tab is not None and tab.tab_id != self.app.active_tab_id:
             return
         self.app.query_one("#status", Static).update(message)
 
     def get_runtime(self, tab: BrowserTab) -> JavaScriptRuntime:
-        """Create a JavaScript runtime if one is not already available."""
+        """Create a persistent JavaScript runtime for this tab."""
         if tab.js is None:
             tab.js = JavaScriptRuntime()
         return tab.js
@@ -80,7 +87,8 @@ class BrowserView:
 
         return ""
 
-    def _append_console_logs(self, page: Text, logs: str) -> Text:
+    @staticmethod
+    def _append_console_logs(page: Text, logs: str) -> Text:
         if logs.strip():
             if page.plain and not page.plain.endswith("\n"):
                 page.append("\n")
@@ -95,15 +103,86 @@ class BrowserView:
         if tab.tab_id != self.app.active_tab_id:
             return
 
-        self.app.query_one("#url", Input).value = tab.url
-        self.app.query_one("#page-text", ClickablePage).set_page(
-            tab.content,
-            tab.links,
-            tab.url,
+        page_widget = self.app.query_one("#page-text", ClickablePage)
+        page_widget.set_page(tab.content, tab.links, tab.url)
+        page_widget.set_event_dispatcher(
+            lambda url, event_type: self.dispatch_link_event(
+                tab, url, event_type
+            )
         )
 
+        self.app.query_one("#url", Input).value = tab.url
         await self.render_forms(tab)
         await self.app.refresh_tabbar()
+
+    @staticmethod
+    def _find_anchor_selector(html: str, page_url: str, target_url: str) -> str | None:
+        """Find a CSS selector for the anchor matching a resolved URL."""
+        soup = BeautifulSoup(html, "html.parser")
+
+        for anchor in soup.find_all("a", href=True):
+            raw_href = str(anchor.get("href", ""))
+            resolved = urljoin(page_url, raw_href)
+
+            if resolved != target_url:
+                continue
+
+            # Escape a quoted attribute value for a CSS selector.
+            escaped = (
+                raw_href.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\a ")
+                .replace("\r", "\\d ")
+            )
+            return f'a[href="{escaped}"]'
+
+        return None
+
+    def dispatch_link_event(
+        self,
+        tab: BrowserTab,
+        url: str,
+        event_type: str = "click",
+    ) -> bool:
+        """Dispatch a DOM event for a link.
+
+        Returns False when the event was canceled with preventDefault().
+        """
+        runtime = tab.js
+
+        if runtime is None or not tab.url:
+            return True
+
+        html = runtime.document_html
+        selector = self._find_anchor_selector(html, tab.url, url)
+
+        if selector is None:
+            return True
+
+        try:
+            allowed = runtime.dispatch_event(selector, event_type)
+        except Exception as exc:
+            self.status(f"JavaScript event error: {exc}", tab)
+            return True
+
+        # Reflect DOM mutations caused by the event in the visible page.
+        updated_html = runtime.document_html or html
+
+        if updated_html != html:
+            page, links, logs = parse_page(updated_html, tab.url, None)
+            tab.content = self._append_console_logs(page, logs)
+            tab.links = links
+
+            if tab.tab_id == self.app.active_tab_id:
+                widget = self.app.query_one("#page-text", ClickablePage)
+                widget.set_page(tab.content, tab.links, tab.url)
+                widget.set_event_dispatcher(
+                    lambda target, kind: self.dispatch_link_event(
+                        tab, target, kind
+                    )
+                )
+
+        return bool(allowed)
 
     async def navigate(
         self,
@@ -116,12 +195,11 @@ class BrowserView:
         tab = tab or self.tab
         if tab is None:
             return False
+
         address = address.strip()
         if not address:
             return False
 
-        # A numeric address is a link only when that link exists. Otherwise it
-        # remains a valid search query (for example, "2026").
         if address.isdigit() and int(address) in tab.links:
             address = tab.links[int(address)]
 
@@ -141,23 +219,42 @@ class BrowserView:
 
         try:
             final_url, html = await fetch_page(url)
+
             if request_id != tab.navigation_id:
                 return False
 
-            title = self.extract_title(html) or (urlparse(final_url).hostname or "Page")
-            forms = parse_forms(html, final_url)
-            page, links, js_logs = parse_page(html, final_url, None)
+            runtime = self.get_runtime(tab)
+            runtime.reset_document(html)
+
+            # First parse executes inline scripts in the persistent runtime.
+            parse_page(html, final_url, runtime)
+
+            # Render the post-script DOM without executing scripts twice.
+            rendered_html = runtime.document_html or html
+            title = self.extract_title(rendered_html) or (
+                urlparse(final_url).hostname or "Page"
+            )
+            forms = parse_forms(rendered_html, final_url)
+            page, links, js_logs = parse_page(
+                rendered_html,
+                final_url,
+                None,
+            )
             content = self._append_console_logs(page, js_logs)
 
-            # Commit page state only after a successful, current response.
+            if request_id != tab.navigation_id:
+                return False
+
             if record_history and old_url and old_url != final_url:
                 tab.back_stack.append(old_url)
                 tab.forward_stack.clear()
+
             tab.url = final_url
             tab.title = title
             tab.forms = forms
             tab.links = links
             tab.content = content
+
             await self._display_tab(tab)
             self.status(f"{tab.title} — {final_url}", tab)
             return True
@@ -165,16 +262,23 @@ class BrowserView:
         except Exception as exc:
             if request_id != tab.navigation_id:
                 return False
+
             tab.forms = []
             tab.links = {}
             tab.title = "Navigation error"
+
             error_page = Text()
-            error_page.append("Could not load page\\n", style="bold red")
-            error_page.append(f"{type(exc).__name__}: {exc}", style="yellow")
+            error_page.append("Could not load page\n", style="bold red")
+            error_page.append(
+                f"{type(exc).__name__}: {exc}",
+                style="yellow",
+            )
             tab.content = error_page
+
             await self._display_tab(tab)
             self.status("Navigation failed", tab)
             return False
+
         finally:
             if request_id == tab.navigation_id:
                 tab.loading = False
@@ -183,8 +287,6 @@ class BrowserView:
         """Render supported HTML forms beneath the page."""
         container = self.app.query_one("#forms", Vertical)
         await container.remove_children()
-
-        # Rebuild this mapping whenever the form panel is rebuilt.
         self.form_widgets.clear()
 
         for form in tab.forms:
@@ -196,19 +298,17 @@ class BrowserView:
                 and (item.name or item.field_type == "checkbox")
             ]
 
-            # Don't render an empty panel for forms that only contain hidden
-            # fields or unsupported controls.
             if not visible_fields and not form.submit_name:
                 continue
 
             panel = Vertical(classes="form-panel")
             await container.mount(panel)
-
-            await panel.mount(Label(f"Form {form.index + 1}", classes="form-heading"))
+            await panel.mount(
+                Label(f"Form {form.index + 1}", classes="form-heading")
+            )
 
             for item in visible_fields:
                 label = item.label or item.name or item.field_type.title()
-
                 widget_id = self.next_widget_id
                 self.next_widget_id += 1
 
@@ -218,13 +318,8 @@ class BrowserView:
                 }
 
                 if item.field_type in {"checkbox", "radio"}:
-                    widget = Checkbox(
-                        label,
-                        value=item.checked,
-                        **common,
-                    )
+                    widget = Checkbox(label, value=item.checked, **common)
                     await panel.mount(widget)
-
                 else:
                     await panel.mount(Label(label, classes="form-label"))
 
@@ -256,10 +351,7 @@ class BrowserView:
                         )
 
                     elif item.field_type == "textarea":
-                        widget = TextArea(
-                            item.value,
-                            **common,
-                        )
+                        widget = TextArea(item.value, **common)
 
                     else:
                         widget = Input(
@@ -275,7 +367,6 @@ class BrowserView:
 
             buttons = Horizontal(classes="form-buttons")
             await panel.mount(buttons)
-
             await buttons.mount(
                 Button(
                     "Submit",
@@ -299,24 +390,18 @@ class BrowserView:
         for item in form.fields:
             widget = self.form_widgets.get((form.index, item.index))
 
-            # Hidden fields have no widget; retain their original values.
             if item.field_type == "hidden":
                 values[item.index] = item.value
-
             elif isinstance(widget, Checkbox):
                 values[item.index] = widget.value
-
             elif isinstance(widget, Select):
                 values[item.index] = (
                     "" if widget.value is Select.BLANK else str(widget.value)
                 )
-
             elif isinstance(widget, TextArea):
                 values[item.index] = widget.text
-
             elif isinstance(widget, Input):
                 values[item.index] = widget.value
-
             else:
                 values[item.index] = item.value
 
@@ -329,7 +414,7 @@ class BrowserView:
             return
 
         form = next(
-            (form for form in tab.forms if form.index == form_index),
+            (item for item in tab.forms if item.index == form_index),
             None,
         )
         if form is None:
@@ -344,6 +429,7 @@ class BrowserView:
             self.status("Submitting form ...", tab)
 
             final_url, html = await send_form(form, values, original_url)
+
             if request_id != tab.navigation_id:
                 return
 
@@ -351,15 +437,20 @@ class BrowserView:
                 tab.back_stack.append(tab.url)
                 tab.forward_stack.clear()
 
+            runtime = self.get_runtime(tab)
+            runtime.reset_document(html)
+            parse_page(html, final_url, runtime)
+            rendered_html = runtime.document_html or html
+
             tab.url = final_url
-            tab.title = self.extract_title(html) or (
+            tab.title = self.extract_title(rendered_html) or (
                 urlparse(final_url).hostname or "Form response"
             )
+            tab.forms = parse_forms(rendered_html, final_url)
 
-            tab.forms = parse_forms(html, final_url)
-            page, links, js_logs = parse_page(html, final_url, None)
+            page, links, logs = parse_page(rendered_html, final_url, None)
             tab.links = links
-            tab.content = self._append_console_logs(page, js_logs)
+            tab.content = self._append_console_logs(page, logs)
 
             await self._display_tab(tab)
             self.status(f"Form submitted — {final_url}", tab)
@@ -374,7 +465,7 @@ class BrowserView:
             return
 
         form = next(
-            (form for form in tab.forms if form.index == form_index),
+            (item for item in tab.forms if item.index == form_index),
             None,
         )
         if form is None:
@@ -385,16 +476,13 @@ class BrowserView:
 
             if isinstance(widget, Checkbox):
                 widget.value = item.checked
-
             elif isinstance(widget, Select):
                 valid_values = {value for value, _ in item.options}
                 widget.value = (
                     item.value if item.value in valid_values else Select.BLANK
                 )
-
             elif isinstance(widget, TextArea):
                 widget.text = item.value
-
             elif isinstance(widget, Input):
                 widget.value = item.value
 
@@ -405,8 +493,10 @@ class BrowserView:
         if tab is None or not tab.back_stack:
             self.status("No previous page.", tab)
             return
+
         previous = tab.back_stack[-1]
         current = tab.url
+
         if await self.navigate(previous, record_history=False, tab=tab):
             tab.back_stack.pop()
             if current:
@@ -417,8 +507,10 @@ class BrowserView:
         if tab is None or not tab.forward_stack:
             self.status("No forward page.", tab)
             return
+
         following = tab.forward_stack[-1]
         current = tab.url
+
         if await self.navigate(following, record_history=False, tab=tab):
             tab.forward_stack.pop()
             if current:

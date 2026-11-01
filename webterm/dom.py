@@ -1,3 +1,4 @@
+
 """Lightweight DOM tree and traversal/mutation layer for Webterm."""
 
 from __future__ import annotations
@@ -92,8 +93,10 @@ class DOMNode:
     def text_content(self, value: str | None) -> None:
         if self.node_type in {DOCUMENT_NODE, ELEMENT_NODE}:
             self._node.clear()
+
             if value is not None and str(value):
                 self._node.append(NavigableString(str(value)))
+
         elif self.node_type in {TEXT_NODE, COMMENT_NODE}:
             self.node_value = value
 
@@ -106,7 +109,11 @@ class DOMNode:
     def child_nodes(self) -> list[DOMNode]:
         if self.node_type not in {DOCUMENT_NODE, ELEMENT_NODE}:
             return []
-        return [self._document._wrap(child) for child in self._node.contents]
+
+        return [
+            self._document._wrap(child)
+            for child in self._node.contents
+        ]
 
     @property
     def children(self) -> list[DOMElement]:
@@ -210,6 +217,7 @@ class DOMNode:
 
         # Prevent inserting an ancestor into one of its descendants.
         ancestor = self._node
+
         while ancestor is not None:
             if ancestor is child._node:
                 raise ValueError(
@@ -410,6 +418,7 @@ class DOMDocument(DOMNode):
             ),
             None,
         )
+
         return self._wrap(node) if node is not None else None
 
     @property

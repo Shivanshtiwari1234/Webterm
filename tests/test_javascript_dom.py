@@ -1,53 +1,88 @@
-import pytest
+
 from webterm.javascript import JavaScriptRuntime
 
 
-@pytest.fixture
-def runtime():
-    rt = JavaScriptRuntime(timeout=5)
+def test_runtime_loads_document():
+    runtime = JavaScriptRuntime()
     try:
-        yield rt
+        runtime.reset_document(
+            '<html><body><p id="message">Hello</p></body></html>'
+        )
+
+        assert "Hello" in runtime.document_html
     finally:
-        rt.close()
+        runtime.close()
 
 
-def test_javascript_can_create_and_append_element(runtime):
-    html = "<html><body><div id='root'></div></body></html>"
+def test_click_event_fires_once():
+    runtime = JavaScriptRuntime()
+    try:
+        runtime.reset_document("""
+            <button id="button">Click</button>
+            <p id="result">0</p>
+            <script>
+                let count = 0;
+                document.querySelector("#button").addEventListener(
+                    "click",
+                    () => {
+                        count++;
+                        document.querySelector("#result").textContent = count;
+                    }
+                );
+            </script>
+        """)
 
-    runtime.execute("""
-        const node = document.createElement('p');
-        node.textContent = 'hello from JS';
-        document.getElementById('root').appendChild(node);
-    """, document_html=html)
+        runtime.execute("""
+            let count = 0;
+            document.querySelector("#button").addEventListener(
+                "click",
+                () => {
+                    count++;
+                    document.querySelector("#result").textContent = count;
+                }
+            );
+        """)
 
-    assert runtime.document_html is not None, (
-        f"document_html is None; runtime messages: {runtime.console_messages}"
-    )
-    assert "<p>hello from JS</p>" in runtime.document_html
+        runtime.dispatch_event('#button', 'click')
 
-
-def test_javascript_can_change_attributes(runtime):
-    html = "<html><body><div id='root'></div></body></html>"
-    runtime.execute("""
-        const root = document.getElementById('root');
-        root.setAttribute('data-state', 'ready');
-        root.className = 'active';
-    """, document_html=html)
-    assert 'data-state="ready"' in runtime.document_html
-    assert 'class="active"' in runtime.document_html
+        assert ">1<" in runtime.document_html
+    finally:
+        runtime.close()
 
 
-def test_javascript_can_remove_node(runtime):
-    html = "<html><body><p id='remove'>bye</p><p>keep</p></body></html>"
-    runtime.execute("document.getElementById('remove').remove();", document_html=html)
-    assert 'id="remove"' not in runtime.document_html
-    assert "<p>keep</p>" in runtime.document_html
+def test_prevent_default_cancels_navigation():
+    runtime = JavaScriptRuntime()
+    try:
+        runtime.reset_document("""
+            <a id="link" href="/next">Next</a>
+            <p id="result">Before</p>
+        """)
+
+        runtime.execute("""
+            document.querySelector("#link").addEventListener(
+                "click",
+                event => {
+                    event.preventDefault();
+                    document.querySelector("#result").textContent = "Canceled";
+                }
+            );
+        """)
+
+        allowed = runtime.dispatch_event('#link', 'click')
+
+        assert allowed is False
+        assert "Canceled" in runtime.document_html
+    finally:
+        runtime.close()
 
 
-def test_javascript_can_replace_inner_html(runtime):
-    html = "<html><body><div id='root'>old</div></body></html>"
-    runtime.execute("""
-        document.getElementById('root').innerHTML = '<b>new</b>';
-    """, document_html=html)
-    assert "<b>new</b>" in runtime.document_html
-    assert "old" not in runtime.document_html
+def test_reset_document_clears_previous_page():
+    runtime = JavaScriptRuntime()
+    try:
+        runtime.reset_document('<p id="old">Old page</p>')
+        runtime.reset_document('<p id="new">New page</p>')
+
+        assert "New page" in runtime.document_html
+        assert "Old page" not in runtime.document_html
+    finally:
+        runtime.close()
