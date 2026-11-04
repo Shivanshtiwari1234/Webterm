@@ -515,6 +515,7 @@ HEADING_STYLES = {
 }
 
 _ANSI_SGR = re.compile(r"\x1b\[([0-9;]*)m")
+_ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _append_canvas_ansi(rendered: Text, source: str) -> None:
@@ -524,14 +525,21 @@ def _append_canvas_ansi(rendered: Text, source: str) -> None:
     cursor = 0
 
     def append_segment(segment: str) -> None:
-        safe = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", segment)
+        safe = _ANSI_CSI.sub("", segment)
+        safe = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", safe)
         if safe:
             rendered.append(safe, style=Style(color=foreground, bgcolor=background))
 
     for match in _ANSI_SGR.finditer(source):
         append_segment(source[cursor:match.start()])
         cursor = match.end()
-        codes = [int(code) if code else 0 for code in match.group(1).split(";")]
+        try:
+            codes = [
+                int(code) if code else 0
+                for code in match.group(1).split(";")
+            ]
+        except ValueError:
+            continue
         index = 0
         while index < len(codes):
             code = codes[index]
@@ -542,7 +550,11 @@ def _append_canvas_ansi(rendered: Text, source: str) -> None:
             elif code == 49:
                 background = None
             elif code in {38, 48} and index + 4 < len(codes) and codes[index + 1] == 2:
-                color = "#{:02x}{:02x}{:02x}".format(*codes[index + 2:index + 5])
+                channels = [
+                    max(0, min(255, channel))
+                    for channel in codes[index + 2:index + 5]
+                ]
+                color = "#{:02x}{:02x}{:02x}".format(*channels)
                 if code == 38:
                     foreground = color
                 else:

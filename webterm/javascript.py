@@ -59,6 +59,29 @@ def _javascript_worker(
                 return None
             return nodes.get(int(node_id))
 
+        def canvas_dimension(element: DOMElement, name: str) -> int:
+            default = 300 if name == "width" else 150
+            value = element.get_attribute(name)
+            if value is None:
+                return default
+            try:
+                dimension = int(value)
+            except ValueError:
+                return default
+            if dimension < 0:
+                return default
+            return max(1, min(2048, dimension))
+
+        def resize_canvas(node_id: int, element: DOMElement) -> None:
+            renderer = canvases.get(node_id)
+            if renderer is None or element.tag_name != "CANVAS":
+                return
+            renderer.resize(
+                canvas_dimension(element, "width"),
+                canvas_dimension(element, "height"),
+            )
+            element.set_attribute("data-webterm-canvas", renderer.to_ansi())
+
         def canvas_call(operation: str, args_json: str) -> str:
             try:
                 args = json.loads(args_json)
@@ -73,7 +96,8 @@ def _javascript_worker(
                     renderer = canvases.get(node_id)
                     if renderer is None:
                         renderer = CanvasRasterizer(
-                            args.get("width", 300), args.get("height", 150)
+                            canvas_dimension(element, "width"),
+                            canvas_dimension(element, "height"),
                         )
                         canvases[node_id] = renderer
                     return json.dumps(True)
@@ -218,22 +242,11 @@ def _javascript_worker(
                     elif isinstance(node, DOMElement):
                         if name in {"width", "height"} and node.tag_name == "CANVAS":
                             try:
-                                dimension = max(0, int(float(value)))
+                                dimension = max(1, min(2048, int(float(value))))
                             except (TypeError, ValueError, OverflowError):
-                                dimension = 0
+                                dimension = 1
                             node.set_attribute(name, dimension)
-                            renderer = canvases.get(int(node_id))
-                            if renderer is not None:
-                                width = dimension if name == "width" else int(
-                                    node.get_attribute("width") or 300
-                                )
-                                height = dimension if name == "height" else int(
-                                    node.get_attribute("height") or 150
-                                )
-                                renderer.resize(width or 300, height or 150)
-                                node.set_attribute(
-                                    "data-webterm-canvas", renderer.to_ansi()
-                                )
+                            resize_canvas(int(node_id), node)
                         elif name == "id":
                             node.id = "" if value is None else str(value)
                         elif name == "className":
@@ -333,8 +346,8 @@ def _javascript_worker(
                         })
                         if node.tag_name == "CANVAS":
                             properties.update({
-                                "width": int(width) if width else 300,
-                                "height": int(height) if height else 150,
+                                "width": canvas_dimension(node, "width"),
+                                "height": canvas_dimension(node, "height"),
                             })
 
                     return json.dumps(properties.get(name))
@@ -349,17 +362,20 @@ def _javascript_worker(
                     if not isinstance(node, DOMElement):
                         raise TypeError("setAttribute requires an element")
 
-                    node.set_attribute(
-                        args["name"],
-                        args.get("value", ""),
-                    )
+                    name = str(args["name"]).lower()
+                    node.set_attribute(name, args.get("value", ""))
+                    if node.tag_name == "CANVAS" and name in {"width", "height"}:
+                        resize_canvas(int(node_id), node)
                     return json.dumps(True)
 
                 if operation == "removeAttribute":
                     if not isinstance(node, DOMElement):
                         raise TypeError("removeAttribute requires an element")
 
-                    node.remove_attribute(args["name"])
+                    name = str(args["name"]).lower()
+                    node.remove_attribute(name)
+                    if node.tag_name == "CANVAS" and name in {"width", "height"}:
+                        resize_canvas(int(node_id), node)
                     return json.dumps(True)
 
                 if operation == "hasAttribute":
@@ -431,6 +447,7 @@ def _javascript_worker(
             };
 
             const __nodeCache = new Map();
+            const __canvasContexts = new Map();
             const __listeners = new Map();
 
             let __eventStopped = false;
@@ -692,11 +709,16 @@ def _javascript_worker(
 
                 node.getContext = (type, options = {}) => {
                     if (node.tagName !== "CANVAS") return null;
+                    const contextType = String(type);
+                    if (contextType.toLowerCase() !== "2d") return null;
+                    if (__canvasContexts.has(id)) {
+                        return __canvasContexts.get(id);
+                    }
                     const result = JSON.parse(__webterm_canvas_call(
                         "canvasContext",
                         JSON.stringify({
                             node: id,
-                            type: String(type),
+                            type: contextType,
                             width: node.width,
                             height: node.height,
                             options
@@ -743,6 +765,7 @@ def _javascript_worker(
                             return result;
                         };
                     }
+                    __canvasContexts.set(id, context);
                     return context;
                 };
 
@@ -933,6 +956,7 @@ def _javascript_worker(
 
                 context.eval("""
                     __nodeCache.clear();
+                    __canvasContexts.clear();
                     __listeners.clear();
                 """)
 
@@ -953,6 +977,7 @@ def _javascript_worker(
 
                     context.eval("""
                         __nodeCache.clear();
+                        __canvasContexts.clear();
                         __listeners.clear();
                     """)
 
