@@ -498,7 +498,6 @@ SKIP_TAGS = {
     "style",
     "noscript",
     "svg",
-    "canvas",
     "iframe",
     "object",
     "embed",
@@ -514,6 +513,43 @@ HEADING_STYLES = {
     "h5": Style(bold=True, italic=True),
     "h6": Style(dim=True, bold=True),
 }
+
+_ANSI_SGR = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def _append_canvas_ansi(rendered: Text, source: str) -> None:
+    """Append canvas ANSI output as styled Rich text, never raw terminal codes."""
+    foreground: str | None = None
+    background: str | None = None
+    cursor = 0
+
+    def append_segment(segment: str) -> None:
+        safe = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", segment)
+        if safe:
+            rendered.append(safe, style=Style(color=foreground, bgcolor=background))
+
+    for match in _ANSI_SGR.finditer(source):
+        append_segment(source[cursor:match.start()])
+        cursor = match.end()
+        codes = [int(code) if code else 0 for code in match.group(1).split(";")]
+        index = 0
+        while index < len(codes):
+            code = codes[index]
+            if code == 0:
+                foreground = background = None
+            elif code == 39:
+                foreground = None
+            elif code == 49:
+                background = None
+            elif code in {38, 48} and index + 4 < len(codes) and codes[index + 1] == 2:
+                color = "#{:02x}{:02x}{:02x}".format(*codes[index + 2:index + 5])
+                if code == 38:
+                    foreground = color
+                else:
+                    background = color
+                index += 4
+            index += 1
+    append_segment(source[cursor:])
 
 
 def _parse_css_declarations(source: str) -> dict[str, str]:
@@ -697,6 +733,14 @@ def parse_page(
             return
 
         tag = node.name.lower()
+
+        if tag == "canvas":
+            canvas_output = node.get("data-webterm-canvas")
+            if canvas_output:
+                ensure_newlines(1)
+                _append_canvas_ansi(rendered, str(canvas_output))
+                ensure_newlines(1)
+            return
 
         if tag in SKIP_TAGS:
             return

@@ -14,6 +14,7 @@ def _javascript_worker(
     try:
         import quickjs
 
+        from .canvas import CanvasRasterizer
         from .dom import DOMDocument, DOMElement, DOMNode
 
         context = quickjs.Context()
@@ -22,6 +23,7 @@ def _javascript_worker(
         document: DOMDocument | None = None
         nodes: dict[int, DOMNode] = {}
         node_ids: dict[int, int] = {}
+        canvases: dict[int, CanvasRasterizer] = {}
         next_node_id = 1
 
         def send(message: tuple) -> None:
@@ -56,6 +58,76 @@ def _javascript_worker(
             if node_id is None:
                 return None
             return nodes.get(int(node_id))
+
+        def canvas_call(operation: str, args_json: str) -> str:
+            try:
+                args = json.loads(args_json)
+                node_id = int(args["node"])
+                element = get_node(node_id)
+                if not isinstance(element, DOMElement) or element.tag_name != "CANVAS":
+                    return json.dumps(None)
+
+                if operation == "canvasContext":
+                    if str(args.get("type", "")).lower() != "2d":
+                        return json.dumps(None)
+                    renderer = canvases.get(node_id)
+                    if renderer is None:
+                        renderer = CanvasRasterizer(
+                            args.get("width", 300), args.get("height", 150)
+                        )
+                        canvases[node_id] = renderer
+                    return json.dumps(True)
+
+                renderer = canvases.get(node_id)
+                if renderer is None:
+                    return json.dumps(None)
+
+                if operation == "canvasGet":
+                    return json.dumps(getattr(renderer, args["name"], None))
+                if operation == "canvasSet":
+                    name = args["name"]
+                    if name in {"fill_style", "stroke_style", "font", "text_align", "text_baseline"}:
+                        setattr(renderer, name, str(args.get("value", "")))
+                    return json.dumps(True)
+
+                values = args.get("values", [])
+                methods = {
+                    "fillRect": (renderer.fill_rect, 4),
+                    "clearRect": (renderer.clear_rect, 4),
+                    "strokeRect": (renderer.stroke_rect, 4),
+                    "beginPath": (renderer.begin_path, 0),
+                    "moveTo": (renderer.move_to, 2),
+                    "lineTo": (renderer.line_to, 2),
+                    "closePath": (renderer.close_path, 0),
+                    "stroke": (renderer.stroke, 0),
+                    "fill": (renderer.fill, 0),
+                    "arc": (renderer.arc, 6),
+                    "fillText": (renderer.draw_text, 3),
+                    "strokeText": (renderer.draw_text, 3),
+                    "measureText": (renderer.measure_text, 1),
+                }
+                method = methods.get(operation)
+                if method is None:
+                    return json.dumps(None)
+                function, argument_count = method
+                call_values = values[:argument_count]
+                if operation == "arc":
+                    call_values[5] = bool(call_values[5]) if len(call_values) > 5 else False
+                if operation in {"fillText", "strokeText"}:
+                    function(*call_values, stroke=operation == "strokeText")
+                else:
+                    result = function(*call_values)
+                    if operation == "measureText":
+                        return json.dumps(result)
+
+                if operation in {
+                    "fillRect", "clearRect", "strokeRect", "stroke", "fill",
+                    "fillText", "strokeText",
+                }:
+                    element.set_attribute("data-webterm-canvas", renderer.to_ansi())
+                return json.dumps(True)
+            except Exception as exc:
+                return json.dumps({"error": str(exc)})
 
         def dom_call(operation: str, args_json: str) -> str:
             try:
@@ -144,7 +216,25 @@ def _javascript_worker(
                         )
 
                     elif isinstance(node, DOMElement):
-                        if name == "id":
+                        if name in {"width", "height"} and node.tag_name == "CANVAS":
+                            try:
+                                dimension = max(0, int(float(value)))
+                            except (TypeError, ValueError, OverflowError):
+                                dimension = 0
+                            node.set_attribute(name, dimension)
+                            renderer = canvases.get(int(node_id))
+                            if renderer is not None:
+                                width = dimension if name == "width" else int(
+                                    node.get_attribute("width") or 300
+                                )
+                                height = dimension if name == "height" else int(
+                                    node.get_attribute("height") or 150
+                                )
+                                renderer.resize(width or 300, height or 150)
+                                node.set_attribute(
+                                    "data-webterm-canvas", renderer.to_ansi()
+                                )
+                        elif name == "id":
                             node.id = "" if value is None else str(value)
                         elif name == "className":
                             node.class_name = (
@@ -222,6 +312,8 @@ def _javascript_worker(
                     }
 
                     if isinstance(node, DOMElement):
+                        width = node.get_attribute("width")
+                        height = node.get_attribute("height")
                         properties.update({
                             "tagName": node.tag_name,
                             "id": node.id,
@@ -239,6 +331,11 @@ def _javascript_worker(
                             ),
                             "childElementCount": node.child_element_count,
                         })
+                        if node.tag_name == "CANVAS":
+                            properties.update({
+                                "width": int(width) if width else 300,
+                                "height": int(height) if height else 150,
+                            })
 
                     return json.dumps(properties.get(name))
 
@@ -291,6 +388,7 @@ def _javascript_worker(
                 return json.dumps({"error": str(exc)})
 
         context.add_callable("__webterm_dom_call", dom_call)
+        context.add_callable("__webterm_canvas_call", canvas_call)
         context.add_callable(
             "__webterm_log",
             lambda message: log("log", message),
@@ -503,7 +601,7 @@ def _javascript_worker(
                 for (const name of [
                     "nodeType", "nodeName", "nodeValue", "textContent",
                     "tagName", "id", "className", "innerHTML", "outerHTML",
-                    "childElementCount"
+                    "childElementCount", "width", "height"
                 ]) {
                     Object.defineProperty(node, name, {
                         get: () => property(name),
@@ -591,6 +689,62 @@ def _javascript_worker(
                         node: id,
                         name: String(name)
                     });
+
+                node.getContext = (type, options = {}) => {
+                    if (node.tagName !== "CANVAS") return null;
+                    const result = JSON.parse(__webterm_canvas_call(
+                        "canvasContext",
+                        JSON.stringify({
+                            node: id,
+                            type: String(type),
+                            width: node.width,
+                            height: node.height,
+                            options
+                        })
+                    ));
+                    if (!result) return null;
+
+                    const context = {};
+                    Object.defineProperty(context, "canvas", { value: node });
+                    const state = {
+                        fillStyle: "fill_style",
+                        strokeStyle: "stroke_style",
+                        font: "font",
+                        textAlign: "text_align",
+                        textBaseline: "text_baseline"
+                    };
+                    for (const [property, name] of Object.entries(state)) {
+                        Object.defineProperty(context, property, {
+                            get: () => JSON.parse(__webterm_canvas_call(
+                                "canvasGet",
+                                JSON.stringify({ node: id, name })
+                            )),
+                            set: value => __webterm_canvas_call(
+                                "canvasSet",
+                                JSON.stringify({ node: id, name, value })
+                            ),
+                            enumerable: true
+                        });
+                    }
+                    const methods = [
+                        "fillRect", "clearRect", "strokeRect", "beginPath",
+                        "moveTo", "lineTo", "closePath", "stroke", "fill",
+                        "arc", "fillText", "strokeText", "measureText"
+                    ];
+                    for (const method of methods) {
+                        context[method] = (...values) => {
+                            const result = JSON.parse(__webterm_canvas_call(
+                                method,
+                                JSON.stringify({ node: id, values })
+                            ));
+                            if (result && typeof result === "object" && "error" in result) {
+                                throw new Error(result.error);
+                            }
+                            return result;
+                        };
+                    }
+                    return context;
+                };
 
                 node.querySelector = selector =>
                     __wrapNode(__domCall("elementQuerySelector", {
@@ -774,6 +928,7 @@ def _javascript_worker(
                 document = DOMDocument(message[1])
                 nodes.clear()
                 node_ids.clear()
+                canvases.clear()
                 next_node_id = 1
 
                 context.eval("""
@@ -793,6 +948,7 @@ def _javascript_worker(
                     document = DOMDocument(html)
                     nodes.clear()
                     node_ids.clear()
+                    canvases.clear()
                     next_node_id = 1
 
                     context.eval("""
